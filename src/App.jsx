@@ -263,8 +263,8 @@ function playJoinSound() {
   try {
     const audio = new Audio("/join-sound.mp3");
     audio.volume = 0.5;
-    audio.play().catch(() => {});
-  } catch (err) { /* ignora se o navegador bloquear autoplay */ }
+    audio.play().catch((err) => console.warn("[join-sound] não tocou:", err.name, err.message));
+  } catch (err) { console.warn("[join-sound] erro:", err); }
 }
 
 function useVoiceCall(profile) {
@@ -541,7 +541,8 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   useEffect(() => { loadServers(); loadFriends(); markPresence("online"); 
     const onUnload = () => markPresence("offline");
     window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
+    const presenceInterval = setInterval(loadFriends, 20000);
+    return () => { window.removeEventListener("beforeunload", onUnload); clearInterval(presenceInterval); };
   }, []);
 
   useEffect(() => {
@@ -586,7 +587,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   async function loadFriends() {
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("*, sender:sender_id(id, username, display_name, avatar_color), receiver:receiver_id(id, username, display_name, avatar_color)")
+      .select("*, sender:sender_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status), receiver:receiver_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status)")
       .or(`sender_id.eq.${profile.id},receiver_id.eq.${profile.id}`);
     if (error) { console.error(error); return; }
     const accepted = [];
@@ -596,6 +597,12 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
       if (r.status === "accepted") accepted.push(other);
       else if (r.status === "pending") pend.push({ ...r, other, isReceiver: r.receiver_id === profile.id });
     });
+    if (accepted.length > 0) {
+      const ids = accepted.map((f) => f.id);
+      const { data: pres } = await supabase.from("user_presence").select("*").in("user_id", ids);
+      const presMap = Object.fromEntries((pres || []).map((p) => [p.user_id, p]));
+      accepted.forEach((f) => { f.liveStatus = presMap[f.id]?.status ?? "offline"; });
+    }
     setFriends(accepted);
     setPending(pend);
   }
@@ -694,7 +701,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
         homeTab === "mensagens" ? (
           <DirectMessagesView friends={friends} profile={profile} dmFriendId={dmFriendId} setDmFriendId={setDmFriendId} onViewProfile={setViewingUserId} />
         ) : (
-          <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} />
+          <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} onMessage={(id) => { setHomeTab("mensagens"); setDmFriendId(id); }} />
         )
       ) : (
         <>
@@ -1040,9 +1047,19 @@ function MembersPanel({ server, profile, onViewProfile }) {
       if (ids.length === 0) { setMembers([]); return; }
       const { data: profs } = await supabase.from("profiles").select("*").in("id", ids);
       const { data: pres } = await supabase.from("user_presence").select("*").in("user_id", ids);
+      const { data: roleRows } = await supabase.from("roles").select("*").eq("server_id", server.id).order("position");
+      const { data: memberRoleRows } = await supabase.from("member_roles").select("*").eq("server_id", server.id);
       if (!active) return;
+      const rolesById = Object.fromEntries((roleRows || []).map((r) => [r.id, r]));
+      const topRoleByUser = {};
+      (memberRoleRows || []).forEach((mr) => {
+        const role = rolesById[mr.role_id];
+        if (!role) return;
+        const current = topRoleByUser[mr.user_id];
+        if (!current || role.position > current.position) topRoleByUser[mr.user_id] = role;
+      });
       const presMap = Object.fromEntries((pres || []).map((p) => [p.user_id, p.status]));
-      const merged = (profs || []).map((p) => ({ ...p, liveStatus: presMap[p.id] ?? "offline", showTag: !!tagMap[p.id] }));
+      const merged = (profs || []).map((p) => ({ ...p, liveStatus: presMap[p.id] ?? "offline", showTag: !!tagMap[p.id], topRole: topRoleByUser[p.id] || null }));
       merged.sort((a, b) => {
         const rank = (s) => (s === "online" ? 0 : s === "ausente" ? 1 : s === "ocupado" ? 1 : s === "offline" ? 3 : 2);
         return rank(a.liveStatus) - rank(b.liveStatus) || a.display_name.localeCompare(b.display_name);
@@ -1074,17 +1091,21 @@ function MembersPanel({ server, profile, onViewProfile }) {
 
 function MemberRow({ member, onClick, isYou, dim, tagLabel }) {
   const statusMeta = STATUS_META[member.liveStatus] ?? STATUS_META.invisivel;
+  const nameColor = !dim && member.topRole ? member.topRole.color : undefined;
   return (
     <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, cursor: "pointer", opacity: dim ? 0.5 : 1 }}>
       <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
       <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5, color: nameColor }}>
           {member.display_name}{isYou ? " (você)" : ""}
           {member.showTag && tagLabel && (
             <span style={{ fontSize: 9, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{tagLabel}</span>
           )}
         </div>
-        {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
+        {!dim && member.topRole && (
+          <div style={{ fontSize: 10, color: member.topRole.color, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.topRole.name}</div>
+        )}
+        {!dim && !member.topRole && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
       </div>
     </div>
   );
@@ -1093,6 +1114,116 @@ function MemberRow({ member, onClick, isYou, dim, tagLabel }) {
 /* ---------------------------------------------------------
    Configurações do servidor
 --------------------------------------------------------- */
+
+/* ---------------------------------------------------------
+   Cargos do servidor (criar, colorir, atribuir a membros)
+--------------------------------------------------------- */
+
+const ROLE_COLORS = ["#99AAB5", "#8B5CF6", "#4F9DFF", "#FF5470", "#3DDC84", "#FF9D4D", "#22D3EE", "#FFD84D", "#E056FD", "#F2F0F5"];
+
+function RolesManager({ server }) {
+  const [roles, setRoles] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [memberRoleMap, setMemberRoleMap] = useState({}); // roleId -> Set(userId)
+  const [newName, setNewName] = useState("");
+  const [newColor, setNewColor] = useState(ROLE_COLORS[1]);
+  const [expandedRole, setExpandedRole] = useState(null);
+
+  useEffect(() => { load(); }, [server.id]);
+
+  async function load() {
+    const { data: roleRows } = await supabase.from("roles").select("*").eq("server_id", server.id).order("position");
+    setRoles(roleRows || []);
+
+    const { data: memberRows } = await supabase.from("server_members").select("user_id").eq("server_id", server.id);
+    const ids = (memberRows || []).map((r) => r.user_id);
+    if (ids.length > 0) {
+      const { data: profs } = await supabase.from("profiles").select("id, display_name, avatar_color").in("id", ids);
+      setMembers(profs || []);
+    }
+
+    const { data: mr } = await supabase.from("member_roles").select("*").eq("server_id", server.id);
+    const map = {};
+    (mr || []).forEach((r) => {
+      if (!map[r.role_id]) map[r.role_id] = new Set();
+      map[r.role_id].add(r.user_id);
+    });
+    setMemberRoleMap(map);
+  }
+
+  async function createRole(e) {
+    e.preventDefault();
+    if (!newName.trim()) return;
+    const { error } = await supabase.from("roles").insert({ server_id: server.id, name: newName.trim(), color: newColor, position: roles.length });
+    if (error) { alert(error.message); return; }
+    setNewName("");
+    load();
+  }
+
+  async function deleteRole(roleId) {
+    if (!confirm("Apagar esse cargo? Ele some de todo mundo que tem ele.")) return;
+    await supabase.from("roles").delete().eq("id", roleId);
+    load();
+  }
+
+  async function toggleMember(roleId, userId) {
+    const has = memberRoleMap[roleId]?.has(userId);
+    if (has) {
+      await supabase.from("member_roles").delete().eq("server_id", server.id).eq("user_id", userId).eq("role_id", roleId);
+    } else {
+      await supabase.from("member_roles").insert({ server_id: server.id, user_id: userId, role_id: roleId });
+    }
+    load();
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: 11.5, color: "#8B8894", marginBottom: 8, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.4 }}>Cargos</div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+        {roles.map((r) => (
+          <div key={r.id}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, background: "#17171c" }}>
+              <span style={{ width: 10, height: 10, borderRadius: "50%", background: r.color, flexShrink: 0 }} />
+              <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: r.color }}>{r.name}</span>
+              <span style={{ fontSize: 11, color: "#5A5866" }}>{memberRoleMap[r.id]?.size || 0} membro(s)</span>
+              <button onClick={() => setExpandedRole(expandedRole === r.id ? null : r.id)} style={{ background: "transparent", border: "none", color: "#8B8894", cursor: "pointer", fontSize: 12 }}>
+                {expandedRole === r.id ? "▲" : "▼"}
+              </button>
+              <button onClick={() => deleteRole(r.id)} style={{ background: "transparent", border: "none", color: "#FF5470", cursor: "pointer", fontSize: 12 }}>✕</button>
+            </div>
+            {expandedRole === r.id && (
+              <div style={{ padding: "8px 10px 4px 26px", display: "flex", flexDirection: "column", gap: 4 }}>
+                {members.map((m) => {
+                  const has = memberRoleMap[r.id]?.has(m.id);
+                  return (
+                    <div key={m.id} onClick={() => toggleMember(r.id, m.id)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "3px 0" }}>
+                      <div style={{ width: 15, height: 15, borderRadius: 4, border: `1.5px solid ${has ? r.color : "#3a3842"}`, background: has ? r.color : "transparent", flexShrink: 0 }} />
+                      <span style={{ fontSize: 12.5 }}>{m.display_name}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ))}
+        {roles.length === 0 && <div style={{ fontSize: 12, color: "#5A5866" }}>Nenhum cargo criado ainda.</div>}
+      </div>
+
+      <form onSubmit={createRole} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Nome do cargo" style={{ ...inputStyle, flex: 1 }} maxLength={20} />
+          <button type="submit" style={{ ...secondaryBtn, width: "auto", padding: "0 14px" }}>Criar</button>
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {ROLE_COLORS.map((c) => (
+            <div key={c} onClick={() => setNewColor(c)} style={{ width: 20, height: 20, borderRadius: "50%", background: c, cursor: "pointer", border: newColor === c ? "2px solid #F0EEF5" : "2px solid transparent" }} />
+          ))}
+        </div>
+      </form>
+    </div>
+  );
+}
 
 function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDeleted, onServerUpdated }) {
   const isOwner = server.owner_id === profile.id;
@@ -1193,6 +1324,10 @@ function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDele
                 <button type="button" onClick={saveTag} style={{ ...secondaryBtn, width: "auto", padding: "0 16px" }}>Salvar</button>
               </div>
             </Field>
+
+            <div style={{ marginTop: 6, paddingTop: 16, borderTop: "1px solid #1e1e24" }}>
+              <RolesManager server={server} />
+            </div>
           </>
         )}
 
@@ -1423,7 +1558,7 @@ function AttachmentView({ attachment }) {
    (Amigos / Adicionar amigo / Pedidos de amizade / servidores)
 --------------------------------------------------------- */
 
-function HomeSidebar({ tab, onSelectTab, pendingCount, onCreateServer, onJoinServer }) {
+function HomeSidebar({ tab, onSelectTab, pendingCount }) {
   const navItems = [
     { key: "todos", label: "Amigos", icon: "👥" },
     { key: "mensagens", label: "Mensagens diretas", icon: "💬" },
@@ -1439,11 +1574,6 @@ function HomeSidebar({ tab, onSelectTab, pendingCount, onCreateServer, onJoinSer
         {navItems.map((item) => (
           <HomeNavItem key={item.key} active={tab === item.key} onClick={() => onSelectTab(item.key)} icon={item.icon} label={item.label} />
         ))}
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        <HomeNavItem onClick={onCreateServer} icon="✨" label="Criar servidor" />
-        <HomeNavItem onClick={onJoinServer} icon="🔑" label="Entrar em servidor" />
       </div>
     </div>
   );
@@ -1471,7 +1601,7 @@ function HomeNavItem({ active, onClick, icon, label }) {
    Amigos — conteúdo principal (varia com a aba escolhida na sidebar)
 --------------------------------------------------------- */
 
-function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewProfile }) {
+function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage }) {
   const [addValue, setAddValue] = useState("");
   const incoming = pending.filter((p) => p.isReceiver);
   const outgoing = pending.filter((p) => !p.isReceiver);
@@ -1498,18 +1628,7 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewP
         )}
 
         {tab === "todos" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            {friends.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum amigo ainda. Vai em "Adicionar amigo" na barra lateral ☝</div>}
-            {friends.map((f) => (
-              <div key={f.id} onClick={() => onViewProfile?.(f.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer" }}>
-                <Avatar color={f.avatar_color} name={f.display_name} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
-                  <div style={{ fontSize: 12, color: "#8B8894" }}>@{f.username}</div>
-                </div>
-              </div>
-            ))}
-          </div>
+          <FriendsGroupedList friends={friends} onViewProfile={onViewProfile} onMessage={onMessage} />
         )}
 
         {tab === "pendentes" && (
@@ -2103,6 +2222,52 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
           <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
         </form>
       </div>
+    </div>
+  );
+}
+
+function FriendsGroupedList({ friends, onViewProfile, onMessage }) {
+  const online = friends.filter((f) => f.liveStatus && f.liveStatus !== "offline" && f.liveStatus !== "invisivel");
+  const offline = friends.filter((f) => !f.liveStatus || f.liveStatus === "offline" || f.liveStatus === "invisivel");
+  const inCall = []; // reservado pra quando tivermos presença de call global entre amigos
+
+  if (friends.length === 0) {
+    return <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum amigo ainda. Vai em "Adicionar amigo" na barra lateral ☝</div>;
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      {online.length > 0 && <ChannelGroupLabel>Online — {online.length}</ChannelGroupLabel>}
+      {online.map((f) => <FriendRow key={f.id} f={f} onViewProfile={onViewProfile} onMessage={onMessage} />)}
+      {offline.length > 0 && <ChannelGroupLabel style={{ marginTop: online.length ? 16 : 0 }}>Offline — {offline.length}</ChannelGroupLabel>}
+      {offline.map((f) => <FriendRow key={f.id} f={f} onViewProfile={onViewProfile} onMessage={onMessage} dim />)}
+    </div>
+  );
+}
+
+function FriendRow({ f, onViewProfile, onMessage, dim }) {
+  const statusMeta = STATUS_META[f.liveStatus] ?? STATUS_META.invisivel;
+  return (
+    <div
+      onClick={() => onViewProfile?.(f.id)}
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer", opacity: dim ? 0.55 : 1 }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "#141418")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <Avatar color={f.avatar_color} name={f.display_name} status={dim ? null : f.liveStatus} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
+        <div style={{ fontSize: 12, color: dim ? "#5A5866" : (statusMeta.color ?? "#8B8894"), overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {f.custom_status || (dim ? "Offline" : statusMeta.label)}
+        </div>
+      </div>
+      <button
+        onClick={(e) => { e.stopPropagation(); onMessage?.(f.id); }}
+        title="Mandar mensagem"
+        style={{ background: "#1c1c22", border: "1px solid #2a2a32", color: "#F0EEF5", borderRadius: 8, padding: "6px 12px", fontSize: 12.5, cursor: "pointer", flexShrink: 0 }}
+      >
+        💬
+      </button>
     </div>
   );
 }
