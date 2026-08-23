@@ -13,6 +13,10 @@ const ACCENTS = {
   vermelho: { name: "Vermelho", hex: "#FF5470", soft: "#FF54701a" },
   verde: { name: "Verde", hex: "#3DDC84", soft: "#3DDC841a" },
   laranja: { name: "Laranja", hex: "#FF9D4D", soft: "#FF9D4D1a" },
+  ciano: { name: "Ciano", hex: "#22D3EE", soft: "#22D3EE1a" },
+  amarelo: { name: "Amarelo", hex: "#FFD84D", soft: "#FFD84D1a" },
+  magenta: { name: "Magenta", hex: "#E056FD", soft: "#E056FD1a" },
+  lima: { name: "Lima", hex: "#A3E635", soft: "#A3E6351a" },
 };
 
 const STATUS_META = {
@@ -22,7 +26,10 @@ const STATUS_META = {
   invisivel: { label: "Invisível", color: "#5A5866" },
 };
 
-const AVATAR_PALETTE = ["#8B5CF6", "#4F9DFF", "#FF5470", "#3DDC84", "#FF9D4D", "#F2F0F5", "#F794C0", "#0a0a0d"];
+const AVATAR_PALETTE = [
+  "#8B5CF6", "#4F9DFF", "#FF5470", "#3DDC84", "#FF9D4D", "#F2F0F5", "#F794C0", "#0a0a0d",
+  "#22D3EE", "#FFD84D", "#E056FD", "#A3E635", "#FF3B3B", "#14B8A6",
+];
 
 const AVATAR_FRAMES = {
   nenhuma: { name: "Nenhuma", render: () => null },
@@ -33,6 +40,9 @@ const AVATAR_FRAMES = {
   neon: { name: "Neon", render: () => null },
   gelo: { name: "Gelo", render: () => null },
   fogo: { name: "Fogo", render: () => null },
+  ouro: { name: "Ouro", render: () => null },
+  esmeralda: { name: "Esmeralda", render: () => null },
+  sakura: { name: "Sakura", render: () => null },
   personalizada: { name: "Sua imagem", render: () => null },
 };
 
@@ -241,6 +251,14 @@ const linkStyle = { color: "var(--accent)", cursor: "pointer", fontWeight: 600 }
    entre os participantes depois disso.
 --------------------------------------------------------- */
 
+function playJoinSound() {
+  try {
+    const audio = new Audio("/join-sound.mp3");
+    audio.volume = 0.5;
+    audio.play().catch(() => {});
+  } catch (err) { /* ignora se o navegador bloquear autoplay */ }
+}
+
 function useVoiceCall(profile) {
   const [joinedChannelId, setJoinedChannelId] = useState(null);
   const [participants, setParticipants] = useState({});
@@ -309,6 +327,7 @@ function useVoiceCall(profile) {
     localStreamRef.current = stream;
     setJoinedChannelId(channelId);
     setParticipants({});
+    playJoinSound();
 
     const ch = supabase.channel(`voice:${channelId}`, { config: { presence: { key: profile.id } } });
     channelRef.current = ch;
@@ -317,6 +336,7 @@ function useVoiceCall(profile) {
       if (key === profile.id) return;
       setParticipants((p) => ({ ...p, [key]: { ...(p[key] || {}), name: newPresences[0]?.name || "?" } }));
       if (profile.id < key) createPeerConnection(key);
+      playJoinSound();
     });
     ch.on("presence", { event: "leave" }, ({ key }) => {
       pcsRef.current[key]?.close();
@@ -405,8 +425,12 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showJoinServer, setShowJoinServer] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
+  const [showServerSettings, setShowServerSettings] = useState(false);
+  const [viewingUserId, setViewingUserId] = useState(null);
   const [fullscreenCall, setFullscreenCall] = useState(false);
   const call = useVoiceCall(profile);
+  const friendIds = new Set(friends.map((f) => f.id));
+  const pendingIds = new Set(pending.map((p) => p.other.id));
 
   const currentServer = servers.find((s) => s.id === currentServerId);
   const currentChannel = channels.find((c) => c.id === currentChannelId);
@@ -539,6 +563,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
                 currentChannelId={currentChannelId}
                 onSelectChannel={setCurrentChannelId}
                 call={call}
+                onOpenSettings={() => setShowServerSettings(true)}
               />
             )}
           </div>
@@ -555,13 +580,25 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           onToggleFullscreen={() => setFullscreenCall((f) => !f)}
         />
       ) : view === "home" ? (
-        <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} />
+        <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} />
       ) : (
-        <ChatArea channel={currentChannel} profile={profile} />
+        <>
+          <ChatArea channel={currentChannel} profile={profile} onViewProfile={setViewingUserId} />
+          {!fullscreenCall && currentServer && <MembersPanel server={currentServer} profile={profile} onViewProfile={setViewingUserId} />}
+        </>
       )}
 
       {showCreateServer && <CreateServerModal onClose={() => setShowCreateServer(false)} onCreate={createServer} />}
       {showJoinServer && <JoinServerModal onClose={() => setShowJoinServer(false)} onJoin={joinServer} />}
+      {showServerSettings && currentServer && (
+        <ServerSettingsModal
+          server={currentServer}
+          profile={profile}
+          onClose={() => setShowServerSettings(false)}
+          onRenamed={(name) => setServers((prev) => prev.map((s) => (s.id === currentServer.id ? { ...s, name } : s)))}
+          onLeftOrDeleted={() => { setShowServerSettings(false); setView("home"); setCurrentServerId(null); loadServers(); }}
+        />
+      )}
       {showProfile && (
         <ProfileModal
           profile={profile}
@@ -573,6 +610,15 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           }}
           onClose={() => setShowProfile(false)}
           onLogout={onLogout}
+        />
+      )}
+      {viewingUserId && viewingUserId !== profile.id && (
+        <UserProfileModal
+          userId={viewingUserId}
+          onClose={() => setViewingUserId(null)}
+          isFriend={friendIds.has(viewingUserId)}
+          isPending={pendingIds.has(viewingUserId)}
+          onAddFriend={async (username) => { await sendFriendRequest(username); }}
         />
       )}
     </div>
@@ -710,22 +756,25 @@ function RailIcon({ active, onClick, children, label }) {
    Sidebar de canais
 --------------------------------------------------------- */
 
-function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call }) {
+function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings }) {
   if (!server) return <div style={{ width: 240, background: "#111114" }} />;
   const textChannels = channels.filter((c) => c.type === "text");
   const voiceChannels = channels.filter((c) => c.type === "voice");
 
   return (
     <div style={{ width: 240, flexShrink: 0, background: "#111114", display: "flex", flexDirection: "column", borderRight: "1px solid #1e1e24" }}>
-      <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid #1e1e24" }}>
-        <div style={{ fontWeight: 700, fontSize: 15 }}>{server.name}</div>
-        <div
-          onClick={() => { navigator.clipboard?.writeText(server.id); }}
-          title="Copiar ID pra convidar"
-          style={{ fontSize: 10.5, color: "#5A5866", marginTop: 3, cursor: "pointer" }}
-        >
-          ID: {server.id.slice(0, 8)}... (clique pra copiar)
+      <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{server.name}</div>
+          <div
+            onClick={() => { navigator.clipboard?.writeText(server.id); }}
+            title="Copiar ID pra convidar"
+            style={{ fontSize: 10.5, color: "#5A5866", marginTop: 3, cursor: "pointer" }}
+          >
+            ID: {server.id.slice(0, 8)}... (clique pra copiar)
+          </div>
         </div>
+        <button onClick={onOpenSettings} title="Configurar servidor" style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 16, cursor: "pointer", flexShrink: 0, padding: 2 }}>⚙</button>
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 10px" }}>
@@ -760,6 +809,148 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
   );
 }
 
+/* ---------------------------------------------------------
+   Painel de membros do servidor (fica do lado do chat,
+   parecido com o do Discord — online em cima, offline embaixo)
+--------------------------------------------------------- */
+
+function MembersPanel({ server, profile, onViewProfile }) {
+  const [members, setMembers] = useState([]);
+
+  useEffect(() => {
+    let active = true;
+    load();
+    const interval = setInterval(load, 15000); // atualiza status a cada 15s
+    return () => { active = false; clearInterval(interval); };
+
+    async function load() {
+      const { data: memberRows, error: mErr } = await supabase
+        .from("server_members")
+        .select("user_id")
+        .eq("server_id", server.id);
+      if (mErr || !active) return;
+      const ids = (memberRows || []).map((r) => r.user_id);
+      if (ids.length === 0) { setMembers([]); return; }
+      const { data: profs } = await supabase.from("profiles").select("*").in("id", ids);
+      const { data: pres } = await supabase.from("user_presence").select("*").in("user_id", ids);
+      if (!active) return;
+      const presMap = Object.fromEntries((pres || []).map((p) => [p.user_id, p.status]));
+      const merged = (profs || []).map((p) => ({ ...p, liveStatus: presMap[p.id] ?? "offline" }));
+      merged.sort((a, b) => {
+        const rank = (s) => (s === "online" ? 0 : s === "ausente" ? 1 : s === "ocupado" ? 1 : s === "offline" ? 3 : 2);
+        return rank(a.liveStatus) - rank(b.liveStatus) || a.display_name.localeCompare(b.display_name);
+      });
+      setMembers(merged);
+    }
+  }, [server.id]);
+
+  const online = members.filter((m) => m.liveStatus && m.liveStatus !== "offline" && m.liveStatus !== "invisivel");
+  const offline = members.filter((m) => !m.liveStatus || m.liveStatus === "offline" || m.liveStatus === "invisivel");
+
+  return (
+    <div style={{ width: 220, flexShrink: 0, background: "#111114", borderLeft: "1px solid #1e1e24", overflowY: "auto", padding: "16px 12px" }}>
+      {online.length > 0 && (
+        <>
+          <ChannelGroupLabel>Online — {online.length}</ChannelGroupLabel>
+          {online.map((m) => <MemberRow key={m.id} member={m} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
+        </>
+      )}
+      {offline.length > 0 && (
+        <>
+          <ChannelGroupLabel style={{ marginTop: 16 }}>Offline — {offline.length}</ChannelGroupLabel>
+          {offline.map((m) => <MemberRow key={m.id} member={m} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} dim />)}
+        </>
+      )}
+    </div>
+  );
+}
+
+function MemberRow({ member, onClick, isYou, dim }) {
+  const statusMeta = STATUS_META[member.liveStatus] ?? STATUS_META.invisivel;
+  return (
+    <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, cursor: "pointer", opacity: dim ? 0.5 : 1 }}>
+      <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.display_name}{isYou ? " (você)" : ""}</div>
+        {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   Configurações do servidor
+--------------------------------------------------------- */
+
+function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDeleted }) {
+  const isOwner = server.owner_id === profile.id;
+  const [name, setName] = useState(server.name);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    if (!name.trim()) return;
+    setSaving(true);
+    const { error } = await supabase.from("servers").update({ name: name.trim() }).eq("id", server.id);
+    setSaving(false);
+    if (error) { alert("Não deu pra salvar: " + error.message); return; }
+    onRenamed(name.trim());
+  }
+
+  async function leaveServer() {
+    if (!confirm("Sair desse servidor?")) return;
+    const { error } = await supabase.from("server_members").delete().eq("server_id", server.id).eq("user_id", profile.id);
+    if (error) { alert(error.message); return; }
+    onLeftOrDeleted();
+  }
+
+  async function deleteServer() {
+    if (!confirm(`Isso apaga o servidor "${server.name}" pra sempre, com todos os canais e mensagens. Tem certeza?`)) return;
+    const { error } = await supabase.from("servers").delete().eq("id", server.id);
+    if (error) { alert("Não deu pra excluir: " + error.message); return; }
+    onLeftOrDeleted();
+  }
+
+  return (
+    <ModalShell onClose={onClose}>
+      <div style={{ padding: 28, width: 380 }}>
+        <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 4 }}>Configurar servidor</div>
+        <div style={{ fontSize: 13, color: "#8B8894", marginBottom: 20 }}>
+          {isOwner ? "Você é o dono desse servidor." : "Você é um membro desse servidor."}
+        </div>
+
+        {isOwner && (
+          <>
+            <Field label="Nome do servidor">
+              <input value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
+            </Field>
+            <button onClick={save} disabled={saving} style={{ ...primaryBtn, opacity: saving ? 0.6 : 1 }}>{saving ? "Salvando..." : "Salvar nome"}</button>
+          </>
+        )}
+
+        <Field label="ID do servidor (pra convidar)">
+          <div
+            onClick={() => navigator.clipboard?.writeText(server.id)}
+            style={{ ...inputStyle, cursor: "pointer", color: "#8B8894", fontSize: 12.5 }}
+            title="Clique pra copiar"
+          >
+            {server.id}
+          </div>
+        </Field>
+
+        <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid #1e1e24" }}>
+          {isOwner ? (
+            <button onClick={deleteServer} style={{ ...secondaryBtn, width: "100%", color: "#FF5470", borderColor: "#3a1c22" }}>Excluir servidor</button>
+          ) : (
+            <button onClick={leaveServer} style={{ ...secondaryBtn, width: "100%", color: "#FF5470", borderColor: "#3a1c22" }}>Sair do servidor</button>
+          )}
+        </div>
+
+        <button type="button" onClick={onClose} style={{ ...secondaryBtn, width: "100%", marginTop: 10 }}>Fechar</button>
+      </div>
+    </ModalShell>
+  );
+}
+
 function ChannelGroupLabel({ children, style }) {
   return <div style={{ fontSize: 11, fontWeight: 700, color: "#5A5866", textTransform: "uppercase", letterSpacing: 0.6, padding: "4px 8px", ...style }}>{children}</div>;
 }
@@ -782,10 +973,12 @@ function ToolBtn({ active, onClick, children, label, danger }) {
    Chat com Realtime
 --------------------------------------------------------- */
 
-function ChatArea({ channel, profile }) {
+function ChatArea({ channel, profile, onViewProfile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
+  const [uploading, setUploading] = useState(false);
   const scrollRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     if (!channel || channel.type !== "text") { setMessages([]); return; }
@@ -794,7 +987,7 @@ function ChatArea({ channel, profile }) {
 
     const sub = supabase
       .channel(`messages:${channel.id}`)
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `channel_id=eq.${channel.id}` }, (payload) => {
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `channel_id=eq.${channel.id}` }, () => {
         loadMessages();
       })
       .subscribe();
@@ -802,7 +995,7 @@ function ChatArea({ channel, profile }) {
     async function loadMessages() {
       const { data, error } = await supabase
         .from("messages")
-        .select("*, profiles(display_name, avatar_color)")
+        .select("*, profiles(display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url), attachments(*)")
         .eq("channel_id", channel.id)
         .order("created_at");
       if (!active) return;
@@ -822,6 +1015,39 @@ function ChatArea({ channel, profile }) {
     setText("");
     const { error } = await supabase.from("messages").insert({ channel_id: channel.id, author_id: profile.id, content });
     if (error) alert(error.message);
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file || !channel) return;
+    if (file.size > 15 * 1024 * 1024) { alert("Arquivo até 15MB por enquanto."); e.target.value = ""; return; }
+    setUploading(true);
+    const path = `${channel.id}/${Date.now()}-${file.name.replace(/[^\w.\-]/g, "_")}`;
+    const { error: upErr } = await supabase.storage.from("attachments").upload(path, file);
+    if (upErr) {
+      setUploading(false);
+      alert(upErr.message.includes("Bucket not found")
+        ? "O espaço de armazenamento de arquivos ainda não foi criado no Supabase (bucket 'attachments')."
+        : "Não deu pra enviar: " + upErr.message);
+      e.target.value = "";
+      return;
+    }
+    const { data: pub } = supabase.storage.from("attachments").getPublicUrl(path);
+    const { data: msg, error: msgErr } = await supabase
+      .from("messages")
+      .insert({ channel_id: channel.id, author_id: profile.id, content: text.trim() })
+      .select()
+      .single();
+    if (!msgErr && msg) {
+      await supabase.from("attachments").insert({
+        message_id: msg.id, file_url: pub.publicUrl, file_name: file.name, file_size: file.size, mime_type: file.type,
+      });
+      setText("");
+    } else if (msgErr) {
+      alert(msgErr.message);
+    }
+    setUploading(false);
+    e.target.value = "";
   }
 
   if (!channel) return <div style={{ flex: 1, background: "#0a0a0d" }} />;
@@ -851,15 +1077,22 @@ function ChatArea({ channel, profile }) {
           const authorColor = m.profiles?.avatar_color ?? "#8B5CF6";
           return (
             <div key={m.id} style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14 }}>
-              <div style={{ width: 38, flexShrink: 0 }}>{!grouped && <Avatar color={authorColor} name={authorName} size={38} />}</div>
-              <div style={{ minWidth: 0 }}>
+              <div style={{ width: 38, flexShrink: 0 }}>
+                {!grouped && (
+                  <div onClick={() => onViewProfile?.(m.author_id)} style={{ cursor: "pointer" }}>
+                    <Avatar color={authorColor} name={authorName} frame={m.profiles?.avatar_frame} avatarUrl={m.profiles?.avatar_url} customFrameUrl={m.profiles?.custom_frame_url} size={38} />
+                  </div>
+                )}
+              </div>
+              <div style={{ minWidth: 0, flex: 1 }}>
                 {!grouped && (
                   <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-                    <span style={{ fontWeight: 700, fontSize: 13.5 }}>{authorName}</span>
+                    <span onClick={() => onViewProfile?.(m.author_id)} style={{ fontWeight: 700, fontSize: 13.5, cursor: "pointer" }}>{authorName}</span>
                     <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
                   </div>
                 )}
-                <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>
+                {m.content && <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>}
+                {m.attachments?.map((a) => <AttachmentView key={a.id} attachment={a} />)}
               </div>
             </div>
           );
@@ -868,11 +1101,36 @@ function ChatArea({ channel, profile }) {
 
       <div style={{ padding: "0 20px 18px" }}>
         <form onSubmit={send} style={{ display: "flex", alignItems: "center", background: "#17171c", border: "1px solid #26242c", borderRadius: 12, padding: "4px 6px 4px 14px" }}>
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} title="Enviar arquivo ou imagem" style={{ background: "transparent", border: "none", color: uploading ? "var(--accent)" : "#8B8894", fontSize: 17, cursor: "pointer", padding: "0 8px 0 0" }}>
+            {uploading ? "..." : "📎"}
+          </button>
+          <input ref={fileInputRef} type="file" onChange={handleFile} style={{ display: "none" }} />
           <input value={text} onChange={(e) => setText(e.target.value)} placeholder={`Conversar em #${channel.name}`} style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 14, padding: "10px 0" }} />
           <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
         </form>
       </div>
     </div>
+  );
+}
+
+function AttachmentView({ attachment }) {
+  const isImage = attachment.mime_type?.startsWith("image/");
+  if (isImage) {
+    return (
+      <a href={attachment.file_url} target="_blank" rel="noreferrer" style={{ display: "inline-block", marginTop: 6 }}>
+        <img src={attachment.file_url} alt={attachment.file_name} style={{ maxWidth: 320, maxHeight: 260, borderRadius: 10, border: "1px solid #26242c", display: "block" }} />
+      </a>
+    );
+  }
+  const sizeKb = attachment.file_size ? Math.round(attachment.file_size / 1024) : null;
+  return (
+    <a href={attachment.file_url} target="_blank" rel="noreferrer" style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, background: "#17171c", border: "1px solid #26242c", borderRadius: 10, padding: "10px 14px", maxWidth: 320, textDecoration: "none", color: "#F0EEF5" }}>
+      <span style={{ fontSize: 20 }}>📄</span>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{attachment.file_name}</div>
+        {sizeKb && <div style={{ fontSize: 11, color: "#8B8894" }}>{sizeKb} KB</div>}
+      </div>
+    </a>
   );
 }
 
@@ -928,7 +1186,7 @@ function HomeNavItem({ active, onClick, icon, label }) {
    Amigos — conteúdo principal (varia com a aba escolhida na sidebar)
 --------------------------------------------------------- */
 
-function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile }) {
+function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewProfile }) {
   const [addValue, setAddValue] = useState("");
   const incoming = pending.filter((p) => p.isReceiver);
   const outgoing = pending.filter((p) => !p.isReceiver);
@@ -958,7 +1216,7 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {friends.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum amigo ainda. Vai em "Adicionar amigo" na barra lateral ☝</div>}
             {friends.map((f) => (
-              <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10 }}>
+              <div key={f.id} onClick={() => onViewProfile?.(f.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer" }}>
                 <Avatar color={f.avatar_color} name={f.display_name} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
@@ -1019,6 +1277,9 @@ function Avatar({ color, name, status, size = 36, frame = "nenhuma", avatarUrl, 
     frame === "neon" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #00E5FF, 0 0 20px 3px #00E5FFaa, 0 0 34px 6px #FF00E5aa` :
     frame === "gelo" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #BFF3FF, 0 0 16px 3px #7FD9FFaa` :
     frame === "fogo" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #FF6A00, 0 0 18px 4px #FF2E0088` :
+    frame === "ouro" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #FFD700, 0 0 20px 3px #FFD70099` :
+    frame === "esmeralda" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #10E0A0, 0 0 18px 3px #10E0A088` :
+    frame === "sakura" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #FFB3D1, 0 0 16px 3px #FF8FC0aa` :
     undefined;
 
   const avatarEl = avatarUrl ? (
@@ -1110,6 +1371,7 @@ function ProfileModal({ profile, onSave, onClose, onLogout }) {
   const [uploading, setUploading] = useState(false);
   const [uploadingBanner, setUploadingBanner] = useState(false);
   const [uploadingFrame, setUploadingFrame] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
 
   async function uploadTo(file, filename, maxMB) {
     if (file.size > maxMB * 1024 * 1024) { alert(`Arquivo muito grande (máx ${maxMB}MB).`); return null; }
@@ -1267,7 +1529,9 @@ function ProfileModal({ profile, onSave, onClose, onLogout }) {
                 </div>
               </Field>
 
-              <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+              <button type="button" onClick={() => setShowPreview(true)} style={{ ...secondaryBtn, width: "100%", marginTop: 4 }}>👁 Ver como os outros veem</button>
+
+              <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
                 <button onClick={onLogout} style={{ ...secondaryBtn, flex: 1, color: "#FF5470", borderColor: "#3a1c22" }}>Sair da conta</button>
                 <button onClick={() => onSave(draft)} style={{ ...primaryBtn, flex: 1, marginTop: 0 }}>Salvar</button>
               </div>
@@ -1275,6 +1539,98 @@ function ProfileModal({ profile, onSave, onClose, onLogout }) {
           </div>
         </div>
       </div>
+      {showPreview && (
+        <ModalShell onClose={() => setShowPreview(false)}>
+          <ProfileCardBody data={{ ...draft, username: profile.username, status: draft.status || "online" }} />
+          <div style={{ padding: "0 20px 20px" }}>
+            <div style={{ fontSize: 11, color: "#5A5866", textAlign: "center", marginBottom: 8 }}>É assim que seu perfil aparece pros outros</div>
+            <button type="button" onClick={() => setShowPreview(false)} style={{ ...secondaryBtn, width: "100%" }}>Fechar</button>
+          </div>
+        </ModalShell>
+      )}
+    </ModalShell>
+  );
+}
+
+/* ---------------------------------------------------------
+   Cartão de perfil (usado no popup de "ver perfil" e também
+   no modo de pré-visualização dentro do editor de perfil)
+--------------------------------------------------------- */
+
+function ProfileCardBody({ data }) {
+  const bannerCss = data.banner_to
+    ? `linear-gradient(120deg, ${data.banner_from}, ${data.banner_to})`
+    : `linear-gradient(120deg, ${data.banner_from || data.avatar_color}, #1c1c22 80%)`;
+  const bannerStyle = data.banner_gif_url
+    ? { backgroundImage: `url(${data.banner_gif_url})`, backgroundSize: "cover", backgroundPosition: "center" }
+    : { background: bannerCss };
+
+  return (
+    <div style={{ width: 340, borderRadius: 16, overflow: "hidden" }}>
+      <div style={{ height: 90, ...bannerStyle }} />
+      <div style={{ padding: "0 20px 20px", marginTop: -32 }}>
+        <Avatar color={data.avatar_color} name={data.display_name} status={data.status} frame={data.avatar_frame} avatarUrl={data.avatar_url} customFrameUrl={data.custom_frame_url} size={64} />
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 17, fontWeight: 800 }}>{data.display_name}</div>
+          <div style={{ fontSize: 12.5, color: "#8B8894" }}>@{data.username}</div>
+        </div>
+        {data.custom_status && (
+          <div style={{ marginTop: 10, fontSize: 12.5, color: STATUS_META[data.status]?.color ?? "#8B8894", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: STATUS_META[data.status]?.color ?? "#5A5866", display: "inline-block" }} />
+            {data.custom_status}
+          </div>
+        )}
+        {data.bio && (
+          <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #26242c", fontSize: 13, color: "#DFDCE6", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+            {data.bio}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend }) {
+  const [data, setData] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    supabase.from("profiles").select("*").eq("id", userId).single().then(({ data, error }) => {
+      if (active && !error) setData(data);
+    });
+    return () => { active = false; };
+  }, [userId]);
+
+  async function handleAdd() {
+    if (!data) return;
+    setSending(true);
+    await onAddFriend(data.username);
+    setSending(false);
+    setSent(true);
+  }
+
+  return (
+    <ModalShell onClose={onClose}>
+      {!data ? (
+        <div style={{ width: 340, padding: 40, textAlign: "center", color: "#8B8894", fontSize: 13 }}>Carregando perfil...</div>
+      ) : (
+        <div>
+          <ProfileCardBody data={data} />
+          <div style={{ padding: "0 20px 20px" }}>
+            {isFriend ? (
+              <div style={{ ...secondaryBtn, width: "100%", textAlign: "center", cursor: "default", color: "#3DDC84", borderColor: "#1e3a2a" }}>✓ Vocês já são amigos</div>
+            ) : isPending || sent ? (
+              <div style={{ ...secondaryBtn, width: "100%", textAlign: "center", cursor: "default" }}>Pedido de amizade enviado</div>
+            ) : (
+              <button onClick={handleAdd} disabled={sending} style={{ ...primaryBtn, marginTop: 0, opacity: sending ? 0.6 : 1 }}>
+                {sending ? "Enviando..." : "Adicionar amigo"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
     </ModalShell>
   );
 }
