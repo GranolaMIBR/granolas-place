@@ -113,6 +113,14 @@ export default function GranolaApp() {
         overflow: "hidden",
       }}
     >
+      <style>{`
+        @keyframes granolaSpeakPulse {
+          0%, 100% { transform: scale(1); }
+          50% { transform: scale(1.045); }
+        }
+        button, [role="button"] { transition: background-color 120ms ease, color 120ms ease, transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease; }
+        button:active { transform: scale(0.97); }
+      `}</style>
       {!session || !profile ? (
         <AuthScreen accent={accent} />
       ) : (
@@ -264,11 +272,27 @@ function useVoiceCall(profile) {
   const [participants, setParticipants] = useState({});
   const [localMuted, setLocalMuted] = useState(false);
   const [localSharing, setLocalSharing] = useState(false);
+  const [speakingIds, setSpeakingIds] = useState(() => new Set());
+  const [localSpeaking, setLocalSpeaking] = useState(false);
 
   const channelRef = useRef(null);
   const pcsRef = useRef({});
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
+  const analyserRafRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const analysersRef = useRef({}); // id -> {analyser, data}
+
+  function presencePayload(muted) {
+    return {
+      name: profile.display_name,
+      avatar_color: profile.avatar_color,
+      avatar_frame: profile.avatar_frame,
+      avatar_url: profile.avatar_url,
+      custom_frame_url: profile.custom_frame_url,
+      muted,
+    };
+  }
 
   function sendSignal(to, data) {
     channelRef.current?.send({ type: "broadcast", event: "signal", payload: { to, from: profile.id, ...data } });
@@ -315,6 +339,56 @@ function useVoiceCall(profile) {
     }
   }
 
+  function getAnalyser(id, stream) {
+    if (!stream) return null;
+    if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    if (analysersRef.current[id]?.stream === stream) return analysersRef.current[id];
+    try {
+      const src = audioCtxRef.current.createMediaStreamSource(stream);
+      const analyser = audioCtxRef.current.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analysersRef.current[id] = { analyser, data, stream };
+      return analysersRef.current[id];
+    } catch { return null; }
+  }
+
+  function startSpeakingLoop() {
+    function tick() {
+      const nextSpeaking = new Set();
+      const localA = getAnalyser("you", localStreamRef.current);
+      if (localA && !localStreamRef.current?.getAudioTracks().every((t) => !t.enabled)) {
+        localA.analyser.getByteTimeDomainData(localA.data);
+        const level = rmsLevel(localA.data);
+        if (level > 10) nextSpeaking.add("you");
+      }
+      Object.entries(participants).forEach(([id, p]) => {
+        if (!p.audioStream) return;
+        const a = getAnalyser(id, p.audioStream);
+        if (!a) return;
+        a.analyser.getByteTimeDomainData(a.data);
+        const level = rmsLevel(a.data);
+        if (level > 10) nextSpeaking.add(id);
+      });
+      setLocalSpeaking(nextSpeaking.has("you"));
+      setSpeakingIds((prev) => {
+        const same = prev.size === nextSpeaking.size && [...prev].every((x) => nextSpeaking.has(x));
+        return same ? prev : nextSpeaking;
+      });
+      analyserRafRef.current = setTimeout(tick, 140);
+    }
+    tick();
+  }
+
+  function stopSpeakingLoop() {
+    if (analyserRafRef.current) { clearTimeout(analyserRafRef.current); analyserRafRef.current = null; }
+    analysersRef.current = {};
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    setSpeakingIds(new Set());
+    setLocalSpeaking(false);
+  }
+
   async function join(channelId) {
     if (joinedChannelId) await leave();
     let stream;
@@ -334,29 +408,44 @@ function useVoiceCall(profile) {
     ch.on("broadcast", { event: "signal" }, ({ payload }) => handleSignal(payload));
     ch.on("presence", { event: "join" }, ({ key, newPresences }) => {
       if (key === profile.id) return;
-      setParticipants((p) => ({ ...p, [key]: { ...(p[key] || {}), name: newPresences[0]?.name || "?" } }));
+      setParticipants((p) => ({ ...p, [key]: { ...(p[key] || {}), ...(newPresences[0] || {}) } }));
       if (profile.id < key) createPeerConnection(key);
       playJoinSound();
+    });
+    ch.on("presence", { event: "sync" }, () => {
+      const state = ch.presenceState();
+      setParticipants((p) => {
+        const next = { ...p };
+        Object.entries(state).forEach(([key, presences]) => {
+          if (key === profile.id) return;
+          next[key] = { ...(next[key] || {}), ...(presences[0] || {}) };
+        });
+        return next;
+      });
     });
     ch.on("presence", { event: "leave" }, ({ key }) => {
       pcsRef.current[key]?.close();
       delete pcsRef.current[key];
+      delete analysersRef.current[key];
       setParticipants((p) => { const n = { ...p }; delete n[key]; return n; });
     });
     ch.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
-        await ch.track({ name: profile.display_name });
+        await ch.track(presencePayload(false));
         const state = ch.presenceState();
         Object.entries(state).forEach(([key, presences]) => {
           if (key === profile.id) return;
-          setParticipants((p) => ({ ...p, [key]: { ...(p[key] || {}), name: presences[0]?.name || "?" } }));
+          setParticipants((p) => ({ ...p, [key]: { ...(p[key] || {}), ...(presences[0] || {}) } }));
           if (profile.id < key && !pcsRef.current[key]) createPeerConnection(key);
         });
       }
     });
+
+    startSpeakingLoop();
   }
 
   async function leave() {
+    stopSpeakingLoop();
     Object.values(pcsRef.current).forEach((pc) => pc.close());
     pcsRef.current = {};
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -378,6 +467,7 @@ function useVoiceCall(profile) {
     setLocalMuted((m) => {
       const next = !m;
       localStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = !next));
+      channelRef.current?.track(presencePayload(next));
       return next;
     });
   }
@@ -406,7 +496,19 @@ function useVoiceCall(profile) {
 
   useEffect(() => () => { leave(); }, []);
 
-  return { joinedChannelId, participants, localMuted, localSharing, join, leave, toggleMute, toggleShare, localScreenStream: screenStreamRef.current };
+  return {
+    joinedChannelId, participants, localMuted, localSharing, join, leave, toggleMute, toggleShare,
+    localScreenStream: screenStreamRef.current, speakingIds, localSpeaking,
+  };
+}
+
+function rmsLevel(byteData) {
+  let sum = 0;
+  for (let i = 0; i < byteData.length; i++) {
+    const v = byteData[i] - 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / byteData.length);
 }
 
 /* ---------------------------------------------------------
@@ -419,6 +521,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   const [pending, setPending] = useState([]);
   const [view, setView] = useState("home");
   const [homeTab, setHomeTab] = useState("todos");
+  const [dmFriendId, setDmFriendId] = useState(null);
   const [currentServerId, setCurrentServerId] = useState(null);
   const [currentChannelId, setCurrentChannelId] = useState(null);
   const [channels, setChannels] = useState([]);
@@ -471,6 +574,13 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
     setChannels(data || []);
     const firstText = data?.find((c) => c.type === "text");
     setCurrentChannelId(firstText?.id ?? null);
+  }
+
+  async function createChannel(name, type) {
+    if (!currentServer) return;
+    const { error } = await supabase.from("channels").insert({ server_id: currentServer.id, name, type, position: channels.length });
+    if (error) { alert("Não deu pra criar o canal: " + error.message); return; }
+    await loadChannels(currentServer.id);
   }
 
   async function loadFriends() {
@@ -564,6 +674,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
                 onSelectChannel={setCurrentChannelId}
                 call={call}
                 onOpenSettings={() => setShowServerSettings(true)}
+                onCreateChannel={createChannel}
               />
             )}
           </div>
@@ -580,7 +691,11 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           onToggleFullscreen={() => setFullscreenCall((f) => !f)}
         />
       ) : view === "home" ? (
-        <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} />
+        homeTab === "mensagens" ? (
+          <DirectMessagesView friends={friends} profile={profile} dmFriendId={dmFriendId} setDmFriendId={setDmFriendId} onViewProfile={setViewingUserId} />
+        ) : (
+          <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} />
+        )
       ) : (
         <>
           <ChatArea channel={currentChannel} profile={profile} onViewProfile={setViewingUserId} />
@@ -596,6 +711,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           profile={profile}
           onClose={() => setShowServerSettings(false)}
           onRenamed={(name) => setServers((prev) => prev.map((s) => (s.id === currentServer.id ? { ...s, name } : s)))}
+          onServerUpdated={(patch) => setServers((prev) => prev.map((s) => (s.id === currentServer.id ? { ...s, ...patch } : s)))}
           onLeftOrDeleted={() => { setShowServerSettings(false); setView("home"); setCurrentServerId(null); loadServers(); }}
         />
       )}
@@ -619,6 +735,9 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           isFriend={friendIds.has(viewingUserId)}
           isPending={pendingIds.has(viewingUserId)}
           onAddFriend={async (username) => { await sendFriendRequest(username); }}
+          onMessage={(userId) => { setViewingUserId(null); setView("home"); setHomeTab("mensagens"); setDmFriendId(userId); }}
+          servers={servers}
+          profile={profile}
         />
       )}
     </div>
@@ -641,6 +760,7 @@ function ProfileFooter({ profile, onOpenProfile }) {
 
 function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) {
   const localVideoRef = useRef(null);
+  const [pinnedId, setPinnedId] = useState(null);
 
   useEffect(() => {
     if (localVideoRef.current && call.localScreenStream) localVideoRef.current.srcObject = call.localScreenStream;
@@ -658,16 +778,28 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
       videoRef: localVideoRef,
       isLocal: true,
       muted: call.localMuted,
+      speaking: call.localSpeaking,
     },
     ...Object.entries(call.participants).map(([id, p]) => ({
       id,
       name: p.name || "...",
-      color: "#4F9DFF",
+      color: p.avatar_color || "#4F9DFF",
+      frame: p.avatar_frame,
+      avatarUrl: p.avatar_url,
+      customFrameUrl: p.custom_frame_url,
       isVideo: !!p.screenStream,
       screenStream: p.screenStream,
-      muted: false,
+      muted: !!p.muted,
+      speaking: call.speakingIds.has(id),
     })),
   ];
+
+  useEffect(() => {
+    if (pinnedId && !tiles.find((t) => t.id === pinnedId)) setPinnedId(null);
+  }, [tiles.length]);
+
+  const pinnedTile = pinnedId ? tiles.find((t) => t.id === pinnedId) : null;
+  const otherTiles = pinnedTile ? tiles.filter((t) => t.id !== pinnedId) : tiles;
 
   return (
     <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
@@ -678,10 +810,27 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
         </button>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto", padding: 20 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
-          {tiles.map((t) => <VoiceTile key={t.id} tile={t} />)}
-        </div>
+      <div style={{ flex: 1, overflow: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+        {pinnedTile ? (
+          <>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <VoiceTile tile={pinnedTile} big onClick={() => setPinnedId(null)} />
+            </div>
+            {otherTiles.length > 0 && (
+              <div style={{ display: "flex", gap: 10, overflowX: "auto", flexShrink: 0 }}>
+                {otherTiles.map((t) => (
+                  <div key={t.id} style={{ width: 160, flexShrink: 0 }}>
+                    <VoiceTile tile={t} onClick={() => setPinnedId(t.id)} thumb />
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
+            {tiles.map((t) => <VoiceTile key={t.id} tile={t} onClick={() => setPinnedId(t.id)} />)}
+          </div>
+        )}
       </div>
 
       <div style={{ padding: 16, borderTop: "1px solid #1e1e24", display: "flex", justifyContent: "center" }}>
@@ -695,9 +844,23 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
   );
 }
 
-function VoiceTile({ tile }) {
+function VoiceTile({ tile, onClick, big, thumb }) {
   return (
-    <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: tile.isVideo ? "#000" : `linear-gradient(135deg, ${tile.color}, #1c1c22)`, minHeight: 190, aspectRatio: "16 / 10", display: "flex", alignItems: "center", justifyContent: "center", border: "1px solid #1e1e24" }}>
+    <div
+      onClick={onClick}
+      title="Clique pra destacar"
+      style={{
+        position: "relative", borderRadius: 12, overflow: "hidden", cursor: "pointer",
+        background: tile.isVideo ? "#000" : `linear-gradient(135deg, ${tile.color}, #1c1c22)`,
+        minHeight: big ? "100%" : thumb ? 90 : 190,
+        height: big ? "100%" : undefined,
+        aspectRatio: big ? undefined : thumb ? "16 / 10" : "16 / 10",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        border: tile.speaking ? "1px solid var(--accent)" : "1px solid #1e1e24",
+        boxShadow: tile.speaking ? "0 0 0 2px var(--accent-soft)" : "none",
+        transition: "border-color 150ms ease, box-shadow 150ms ease",
+      }}
+    >
       {tile.isVideo ? (
         tile.isLocal ? (
           <video ref={tile.videoRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: "contain" }} />
@@ -709,12 +872,14 @@ function VoiceTile({ tile }) {
           />
         )
       ) : (
-        <Avatar color={tile.color} name={tile.name} frame={tile.frame} avatarUrl={tile.avatarUrl} customFrameUrl={tile.customFrameUrl} size={72} />
+        <Avatar color={tile.color} name={tile.name} frame={tile.frame} avatarUrl={tile.avatarUrl} customFrameUrl={tile.customFrameUrl} size={thumb ? 40 : big ? 96 : 72} speaking={tile.speaking && !tile.muted} grayedOut={tile.muted} />
       )}
-      <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,10,13,0.75)", padding: "5px 11px", borderRadius: 8, fontSize: 12.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, maxWidth: "calc(100% - 20px)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-        {tile.name}
-        {tile.muted && <span style={{ fontSize: 11 }}>🔇</span>}
-      </div>
+      {!thumb && (
+        <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,10,13,0.75)", padding: "5px 11px", borderRadius: 8, fontSize: 12.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, maxWidth: "calc(100% - 20px)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {tile.name}
+          {tile.muted && <span style={{ fontSize: 11 }}>🔇</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -731,7 +896,11 @@ function ServerRail({ servers, currentServerId, onHome, onSelect, onCreate, onJo
       <div style={{ display: "flex", flexDirection: "column", gap: 10, overflowY: "auto", maxHeight: "50vh" }}>
         {servers.map((s) => (
           <RailIcon key={s.id} active={s.id === currentServerId} onClick={() => onSelect(s.id)} label={s.name}>
-            <span style={{ fontSize: 12.5, fontWeight: 800 }}>{s.icon}</span>
+            {s.icon_url ? (
+              <img src={s.icon_url} alt={s.name} style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "inherit" }} />
+            ) : (
+              <span style={{ fontSize: 12.5, fontWeight: 800 }}>{s.icon}</span>
+            )}
           </RailIcon>
         ))}
       </div>
@@ -756,7 +925,8 @@ function RailIcon({ active, onClick, children, label }) {
    Sidebar de canais
 --------------------------------------------------------- */
 
-function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings }) {
+function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel }) {
+  const [creatingType, setCreatingType] = useState(null);
   if (!server) return <div style={{ width: 240, background: "#111114" }} />;
   const textChannels = channels.filter((c) => c.type === "text");
   const voiceChannels = channels.filter((c) => c.type === "voice");
@@ -778,11 +948,17 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 10px" }}>
-        <ChannelGroupLabel>Canais de texto</ChannelGroupLabel>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <ChannelGroupLabel>Canais de texto</ChannelGroupLabel>
+          <button onClick={() => setCreatingType("text")} title="Criar canal de texto" style={miniAddBtn}>+</button>
+        </div>
         {textChannels.map((c) => (
           <ChannelRow key={c.id} active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="#" label={c.name} />
         ))}
-        <ChannelGroupLabel style={{ marginTop: 18 }}>Canais de voz</ChannelGroupLabel>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
+          <ChannelGroupLabel>Canais de voz</ChannelGroupLabel>
+          <button onClick={() => setCreatingType("voice")} title="Criar canal de voz" style={miniAddBtn}>+</button>
+        </div>
         {voiceChannels.map((c) => (
           <div key={c.id}>
             <ChannelRow active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="🔊" label={c.name} />
@@ -805,7 +981,37 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
           Você está em outra chamada de voz — clica no canal pra ver.
         </div>
       )}
+
+      {creatingType && (
+        <CreateChannelModal
+          type={creatingType}
+          onClose={() => setCreatingType(null)}
+          onCreate={async (name) => { await onCreateChannel(name, creatingType); setCreatingType(null); }}
+        />
+      )}
     </div>
+  );
+}
+
+const miniAddBtn = { background: "transparent", border: "none", color: "#5A5866", fontSize: 15, cursor: "pointer", padding: "0 6px", lineHeight: 1 };
+
+function CreateChannelModal({ type, onClose, onCreate }) {
+  const [name, setName] = useState("");
+  return (
+    <ModalShell onClose={onClose}>
+      <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onCreate(name.trim()); }} style={{ padding: 26, width: 340 }}>
+        <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 16 }}>
+          Novo canal de {type === "voice" ? "voz" : "texto"}
+        </div>
+        <Field label="Nome do canal">
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={type === "voice" ? "Sala de jogos" : "geral"} style={inputStyle} />
+        </Field>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button type="button" onClick={onClose} style={{ ...secondaryBtn, flex: 1 }}>Cancelar</button>
+          <button type="submit" style={{ ...primaryBtn, flex: 1, marginTop: 0 }}>Criar</button>
+        </div>
+      </form>
+    </ModalShell>
   );
 }
 
@@ -826,16 +1032,17 @@ function MembersPanel({ server, profile, onViewProfile }) {
     async function load() {
       const { data: memberRows, error: mErr } = await supabase
         .from("server_members")
-        .select("user_id")
+        .select("user_id, show_tag")
         .eq("server_id", server.id);
       if (mErr || !active) return;
       const ids = (memberRows || []).map((r) => r.user_id);
+      const tagMap = Object.fromEntries((memberRows || []).map((r) => [r.user_id, r.show_tag]));
       if (ids.length === 0) { setMembers([]); return; }
       const { data: profs } = await supabase.from("profiles").select("*").in("id", ids);
       const { data: pres } = await supabase.from("user_presence").select("*").in("user_id", ids);
       if (!active) return;
       const presMap = Object.fromEntries((pres || []).map((p) => [p.user_id, p.status]));
-      const merged = (profs || []).map((p) => ({ ...p, liveStatus: presMap[p.id] ?? "offline" }));
+      const merged = (profs || []).map((p) => ({ ...p, liveStatus: presMap[p.id] ?? "offline", showTag: !!tagMap[p.id] }));
       merged.sort((a, b) => {
         const rank = (s) => (s === "online" ? 0 : s === "ausente" ? 1 : s === "ocupado" ? 1 : s === "offline" ? 3 : 2);
         return rank(a.liveStatus) - rank(b.liveStatus) || a.display_name.localeCompare(b.display_name);
@@ -852,26 +1059,31 @@ function MembersPanel({ server, profile, onViewProfile }) {
       {online.length > 0 && (
         <>
           <ChannelGroupLabel>Online — {online.length}</ChannelGroupLabel>
-          {online.map((m) => <MemberRow key={m.id} member={m} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
+          {online.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
         </>
       )}
       {offline.length > 0 && (
         <>
           <ChannelGroupLabel style={{ marginTop: 16 }}>Offline — {offline.length}</ChannelGroupLabel>
-          {offline.map((m) => <MemberRow key={m.id} member={m} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} dim />)}
+          {offline.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} dim />)}
         </>
       )}
     </div>
   );
 }
 
-function MemberRow({ member, onClick, isYou, dim }) {
+function MemberRow({ member, onClick, isYou, dim, tagLabel }) {
   const statusMeta = STATUS_META[member.liveStatus] ?? STATUS_META.invisivel;
   return (
     <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, cursor: "pointer", opacity: dim ? 0.5 : 1 }}>
       <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
       <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.display_name}{isYou ? " (você)" : ""}</div>
+        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
+          {member.display_name}{isYou ? " (você)" : ""}
+          {member.showTag && tagLabel && (
+            <span style={{ fontSize: 9, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{tagLabel}</span>
+          )}
+        </div>
         {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
       </div>
     </div>
@@ -882,10 +1094,19 @@ function MemberRow({ member, onClick, isYou, dim }) {
    Configurações do servidor
 --------------------------------------------------------- */
 
-function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDeleted }) {
+function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDeleted, onServerUpdated }) {
   const isOwner = server.owner_id === profile.id;
   const [name, setName] = useState(server.name);
+  const [tag, setTag] = useState(server.tag_label || "");
+  const [showTag, setShowTag] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [uploadingIcon, setUploadingIcon] = useState(false);
+  const fileRef = useRef(null);
+
+  useEffect(() => {
+    supabase.from("server_members").select("show_tag").eq("server_id", server.id).eq("user_id", profile.id).single()
+      .then(({ data }) => setShowTag(!!data?.show_tag));
+  }, [server.id]);
 
   async function save() {
     if (!name.trim()) return;
@@ -894,6 +1115,32 @@ function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDele
     setSaving(false);
     if (error) { alert("Não deu pra salvar: " + error.message); return; }
     onRenamed(name.trim());
+  }
+
+  async function saveTag() {
+    const { error } = await supabase.from("servers").update({ tag_label: tag.trim() || null }).eq("id", server.id);
+    if (error) { alert("Não deu pra salvar a tag: " + error.message); return; }
+    onServerUpdated?.({ tag_label: tag.trim() || null });
+  }
+
+  async function toggleShowTag() {
+    const next = !showTag;
+    setShowTag(next);
+    await supabase.from("server_members").update({ show_tag: next }).eq("server_id", server.id).eq("user_id", profile.id);
+  }
+
+  async function handleIconUpload(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingIcon(true);
+    const path = `server-icons/${server.id}-${Date.now()}-${file.name.replace(/[^\w.\-]/g, "_")}`;
+    const { error: upErr } = await supabase.storage.from("attachments").upload(path, file);
+    if (upErr) { setUploadingIcon(false); alert("Não deu pra enviar: " + upErr.message); return; }
+    const { data: pub } = supabase.storage.from("attachments").getPublicUrl(path);
+    const { error } = await supabase.from("servers").update({ icon_url: pub.publicUrl }).eq("id", server.id);
+    setUploadingIcon(false);
+    if (error) { alert(error.message); return; }
+    onServerUpdated?.({ icon_url: pub.publicUrl });
   }
 
   async function leaveServer() {
@@ -920,11 +1167,48 @@ function ServerSettingsModal({ server, profile, onClose, onRenamed, onLeftOrDele
 
         {isOwner && (
           <>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 16 }}>
+              <div
+                onClick={() => fileRef.current?.click()}
+                onMouseEnter={(e) => { const o = e.currentTarget.querySelector(".iconOverlay"); if (o) o.style.opacity = 1; }}
+                onMouseLeave={(e) => { const o = e.currentTarget.querySelector(".iconOverlay"); if (o) o.style.opacity = 0; }}
+                style={{ position: "relative", width: 72, height: 72, borderRadius: 20, cursor: "pointer", overflow: "hidden", background: server.icon_url ? undefined : "linear-gradient(135deg, var(--accent), #1c1c22)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 22 }}
+              >
+                {server.icon_url ? <img src={server.icon_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : server.icon}
+                <div className="iconOverlay" style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, opacity: 0, transition: "opacity 120ms ease" }}>
+                  {uploadingIcon ? "..." : "Trocar"}
+                </div>
+              </div>
+              <input ref={fileRef} type="file" accept="image/*" onChange={handleIconUpload} style={{ display: "none" }} />
+            </div>
+
             <Field label="Nome do servidor">
               <input value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
             </Field>
             <button onClick={save} disabled={saving} style={{ ...primaryBtn, opacity: saving ? 0.6 : 1 }}>{saving ? "Salvando..." : "Salvar nome"}</button>
+
+            <Field label="Tag do servidor (opcional)">
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={tag} onChange={(e) => setTag(e.target.value)} placeholder="Ex: Moon" style={{ ...inputStyle, flex: 1 }} maxLength={12} />
+                <button type="button" onClick={saveTag} style={{ ...secondaryBtn, width: "auto", padding: "0 16px" }}>Salvar</button>
+              </div>
+            </Field>
           </>
+        )}
+
+        {!isOwner && server.tag_label && (
+          <Field label={`Tag do servidor: ${server.tag_label}`}>
+            <button type="button" onClick={toggleShowTag} style={{ ...(showTag ? primaryBtn : secondaryBtn), marginTop: 0, width: "100%" }}>
+              {showTag ? `✓ Exibindo a tag ${server.tag_label}` : `Exibir a tag ${server.tag_label} no seu nome`}
+            </button>
+          </Field>
+        )}
+        {isOwner && server.tag_label && (
+          <Field label="Sua tag também">
+            <button type="button" onClick={toggleShowTag} style={{ ...(showTag ? primaryBtn : secondaryBtn), marginTop: 0, width: "100%" }}>
+              {showTag ? `✓ Exibindo a tag ${server.tag_label}` : `Exibir a tag ${server.tag_label} no seu nome`}
+            </button>
+          </Field>
         )}
 
         <Field label="ID do servidor (pra convidar)">
@@ -1142,6 +1426,7 @@ function AttachmentView({ attachment }) {
 function HomeSidebar({ tab, onSelectTab, pendingCount, onCreateServer, onJoinServer }) {
   const navItems = [
     { key: "todos", label: "Amigos", icon: "👥" },
+    { key: "mensagens", label: "Mensagens diretas", icon: "💬" },
     { key: "adicionar", label: "Adicionar amigo", icon: "＋" },
     { key: "pendentes", label: `Pedidos de amizade${pendingCount ? ` (${pendingCount})` : ""}`, icon: "🔗" },
   ];
@@ -1261,7 +1546,7 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewP
    Avatar
 --------------------------------------------------------- */
 
-function Avatar({ color, name, status, size = 36, frame = "nenhuma", avatarUrl, customFrameUrl }) {
+function Avatar({ color, name, status, size = 36, frame = "nenhuma", avatarUrl, customFrameUrl, speaking, grayedOut }) {
   const ringWrap = frame === "arco" || frame === "pontilhada";
   const ring = 3;
 
@@ -1271,7 +1556,7 @@ function Avatar({ color, name, status, size = 36, frame = "nenhuma", avatarUrl, 
       ? { padding: ring, borderRadius: "35%", border: `3px dashed ${color}` }
       : {};
 
-  const avatarBoxShadow =
+  let avatarBoxShadow =
     frame === "brilho" ? `0 0 0 3px #0a0a0d, 0 0 0 6px ${color}, 0 0 16px 2px ${color}88` :
     frame === "duplo" ? `0 0 0 3px #0a0a0d, 0 0 0 6px ${color}, 0 0 0 9px #0a0a0d, 0 0 0 11px ${color}55` :
     frame === "neon" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #00E5FF, 0 0 20px 3px #00E5FFaa, 0 0 34px 6px #FF00E5aa` :
@@ -1282,14 +1567,21 @@ function Avatar({ color, name, status, size = 36, frame = "nenhuma", avatarUrl, 
     frame === "sakura" ? `0 0 0 3px #0a0a0d, 0 0 0 5px #FFB3D1, 0 0 16px 3px #FF8FC0aa` :
     undefined;
 
+  if (speaking) {
+    avatarBoxShadow = `0 0 0 3px #0a0a0d, 0 0 0 6px var(--accent), 0 0 18px 3px var(--accent)`;
+  }
+
+  const filter = grayedOut ? "grayscale(1) brightness(0.65)" : undefined;
+  const animation = speaking ? "granolaSpeakPulse 1.1s ease-in-out infinite" : undefined;
+
   const avatarEl = avatarUrl ? (
     <img
       src={avatarUrl}
       alt={name}
-      style={{ width: size, height: size, borderRadius: "30%", objectFit: "cover", display: "block", border: "2px solid var(--accent-soft)", boxShadow: avatarBoxShadow }}
+      style={{ width: size, height: size, borderRadius: "30%", objectFit: "cover", display: "block", border: "2px solid var(--accent-soft)", boxShadow: avatarBoxShadow, filter, animation }}
     />
   ) : (
-    <div style={{ width: size, height: size, borderRadius: "30%", background: `linear-gradient(135deg, ${color}, #1c1c22)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.36, fontWeight: 800, border: "2px solid var(--accent-soft)", boxShadow: avatarBoxShadow }}>
+    <div style={{ width: size, height: size, borderRadius: "30%", background: `linear-gradient(135deg, ${color}, #1c1c22)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: size * 0.36, fontWeight: 800, border: "2px solid var(--accent-soft)", boxShadow: avatarBoxShadow, filter, animation }}>
       {initials(name)}
     </div>
   );
@@ -1590,16 +1882,21 @@ function ProfileCardBody({ data }) {
   );
 }
 
-function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend }) {
+function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend, onMessage, servers, profile }) {
   const [data, setData] = useState(null);
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState(false);
+  const [showMenu, setShowMenu] = useState(false);
+  const [showInvite, setShowInvite] = useState(false);
+  const [blocked, setBlocked] = useState(false);
 
   useEffect(() => {
     let active = true;
     supabase.from("profiles").select("*").eq("id", userId).single().then(({ data, error }) => {
       if (active && !error) setData(data);
     });
+    supabase.from("blocked_users").select("blocked_id").eq("blocker_id", profile.id).eq("blocked_id", userId).maybeSingle()
+      .then(({ data }) => { if (active) setBlocked(!!data); });
     return () => { active = false; };
   }, [userId]);
 
@@ -1611,12 +1908,59 @@ function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend })
     setSent(true);
   }
 
+  async function toggleBlock() {
+    setShowMenu(false);
+    if (blocked) {
+      await supabase.from("blocked_users").delete().eq("blocker_id", profile.id).eq("blocked_id", userId);
+      setBlocked(false);
+    } else {
+      if (!confirm(`Bloquear ${data.display_name}? Vocês não vão mais se ver nas conversas.`)) return;
+      await supabase.from("blocked_users").insert({ blocker_id: profile.id, blocked_id: userId });
+      setBlocked(true);
+    }
+  }
+
+  function report() {
+    setShowMenu(false);
+    alert("Denúncia enviada. Nossa equipe vai revisar em breve.");
+  }
+
+  async function inviteToServer(server) {
+    setShowInvite(false);
+    setShowMenu(false);
+    await supabase.from("direct_messages").insert({
+      sender_id: profile.id,
+      receiver_id: userId,
+      content: `Te chamei pro servidor "${server.name}"! Copia esse ID e usa o botão 🔗 pra entrar: ${server.id}`,
+    });
+    onMessage(userId);
+  }
+
   return (
     <ModalShell onClose={onClose}>
       {!data ? (
         <div style={{ width: 340, padding: 40, textAlign: "center", color: "#8B8894", fontSize: 13 }}>Carregando perfil...</div>
       ) : (
         <div>
+          <div style={{ display: "flex", justifyContent: "flex-end", padding: "10px 10px 0", position: "relative" }}>
+            <button onClick={() => setShowMenu((m) => !m)} style={{ background: "#1c1c22", border: "none", color: "#F0EEF5", width: 28, height: 28, borderRadius: 8, cursor: "pointer", fontWeight: 800 }}>⋯</button>
+            {showMenu && (
+              <div style={{ position: "absolute", top: 42, right: 10, background: "#1c1c22", border: "1px solid #2a2a32", borderRadius: 10, overflow: "hidden", width: 210, zIndex: 5, boxShadow: "0 12px 30px -10px rgba(0,0,0,0.6)" }}>
+                <MenuItem onClick={() => { setShowMenu(false); onMessage(userId); }}>💬 Mandar mensagem</MenuItem>
+                <MenuItem onClick={() => setShowInvite((v) => !v)}>➕ Convidar para servidor</MenuItem>
+                {showInvite && (
+                  <div style={{ maxHeight: 140, overflowY: "auto", borderTop: "1px solid #2a2a32", borderBottom: "1px solid #2a2a32" }}>
+                    {(servers || []).length === 0 && <div style={{ padding: "8px 14px", fontSize: 11.5, color: "#5A5866" }}>Você não tem servidores</div>}
+                    {(servers || []).map((s) => (
+                      <div key={s.id} onClick={() => inviteToServer(s)} style={{ padding: "8px 14px", fontSize: 12.5, cursor: "pointer" }}>{s.name}</div>
+                    ))}
+                  </div>
+                )}
+                <MenuItem onClick={toggleBlock} danger>{blocked ? "✓ Desbloquear" : "🚫 Bloquear"}</MenuItem>
+                <MenuItem onClick={report} danger>⚠ Denunciar perfil de usuário</MenuItem>
+              </div>
+            )}
+          </div>
           <ProfileCardBody data={data} />
           <div style={{ padding: "0 20px 20px" }}>
             {isFriend ? (
@@ -1632,6 +1976,134 @@ function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend })
         </div>
       )}
     </ModalShell>
+  );
+}
+
+function MenuItem({ children, onClick, danger }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{ padding: "10px 14px", fontSize: 13, cursor: "pointer", color: danger ? "#FF5470" : "#F0EEF5", fontWeight: 600 }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "#222229")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      {children}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   Mensagens diretas
+--------------------------------------------------------- */
+
+function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onViewProfile }) {
+  const friend = friends.find((f) => f.id === dmFriendId);
+
+  if (friend) {
+    return <DMChatArea friend={friend} profile={profile} onBack={() => setDmFriendId(null)} onViewProfile={onViewProfile} />;
+  }
+
+  return (
+    <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "20px 24px", borderBottom: "1px solid #1e1e24", fontWeight: 700, fontSize: 16 }}>Mensagens diretas</div>
+      <div style={{ padding: "8px 16px", overflowY: "auto" }}>
+        {friends.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "20px 8px" }}>Adiciona amigos pra poder conversar por aqui.</div>}
+        {friends.map((f) => (
+          <div key={f.id} onClick={() => setDmFriendId(f.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer" }}>
+            <Avatar color={f.avatar_color} name={f.display_name} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
+              <div style={{ fontSize: 12, color: "#8B8894" }}>@{f.username}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DMChatArea({ friend, profile, onBack, onViewProfile }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    let active = true;
+    loadMessages();
+    const sub = supabase
+      .channel(`dm:${[profile.id, friend.id].sort().join(":")}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "direct_messages", filter: `receiver_id=eq.${profile.id}` }, (payload) => {
+        if (payload.new.sender_id === friend.id) loadMessages();
+      })
+      .subscribe();
+
+    async function loadMessages() {
+      const { data, error } = await supabase
+        .from("direct_messages")
+        .select("*")
+        .or(`and(sender_id.eq.${profile.id},receiver_id.eq.${friend.id}),and(sender_id.eq.${friend.id},receiver_id.eq.${profile.id})`)
+        .order("created_at");
+      if (!active) return;
+      if (error) { console.error(error); return; }
+      setMessages(data || []);
+    }
+    return () => { active = false; supabase.removeChannel(sub); };
+  }, [friend.id]);
+
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }, [messages.length]);
+
+  async function send(e) {
+    e.preventDefault();
+    if (!text.trim()) return;
+    const content = text;
+    setText("");
+    const { data, error } = await supabase.from("direct_messages").insert({ sender_id: profile.id, receiver_id: friend.id, content }).select().single();
+    if (error) { alert(error.message); return; }
+    setMessages((m) => [...m, data]);
+  }
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0a0a0d", minWidth: 0 }}>
+      <div style={{ padding: "12px 20px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 16, cursor: "pointer" }}>←</button>
+        <div onClick={() => onViewProfile?.(friend.id)} style={{ cursor: "pointer" }}>
+          <Avatar color={friend.avatar_color} name={friend.display_name} frame={friend.avatar_frame} avatarUrl={friend.avatar_url} customFrameUrl={friend.custom_frame_url} size={30} />
+        </div>
+        <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.display_name}</div>
+      </div>
+
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
+        {messages.length === 0 && <div style={{ color: "#5A5866", fontSize: 13.5, marginTop: 20 }}>Comece a conversa com {friend.display_name}.</div>}
+        {messages.map((m, i) => {
+          const isMe = m.sender_id === profile.id;
+          const prev = messages[i - 1];
+          const grouped = prev && prev.sender_id === m.sender_id;
+          return (
+            <div key={m.id} style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14 }}>
+              <div style={{ width: 38, flexShrink: 0 }}>
+                {!grouped && <Avatar color={isMe ? profile.avatar_color : friend.avatar_color} name={isMe ? profile.display_name : friend.display_name} frame={isMe ? profile.avatar_frame : friend.avatar_frame} avatarUrl={isMe ? profile.avatar_url : friend.avatar_url} customFrameUrl={isMe ? profile.custom_frame_url : friend.custom_frame_url} size={38} />}
+              </div>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                {!grouped && (
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                    <span style={{ fontWeight: 700, fontSize: 13.5 }}>{isMe ? profile.display_name : friend.display_name}</span>
+                    <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
+                  </div>
+                )}
+                <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ padding: "0 20px 18px" }}>
+        <form onSubmit={send} style={{ display: "flex", alignItems: "center", background: "#17171c", border: "1px solid #26242c", borderRadius: 12, padding: "4px 6px 4px 14px" }}>
+          <input value={text} onChange={(e) => setText(e.target.value)} placeholder={`Conversar com ${friend.display_name}`} style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 14, padding: "10px 0" }} />
+          <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
+        </form>
+      </div>
+    </div>
   );
 }
 
