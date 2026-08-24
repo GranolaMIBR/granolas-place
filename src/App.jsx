@@ -72,6 +72,77 @@ function timeFmt(iso) {
    App raiz — controla sessão de autenticação
 --------------------------------------------------------- */
 
+/* ---------------------------------------------------------
+   Sistema de Tilt 3D + Glow (reutilizável)
+   - Não usa state do React durante o movimento (só manipula
+     o DOM direto via ref), pra não re-renderizar a cada pixel.
+   - Respeita prefers-reduced-motion.
+--------------------------------------------------------- */
+
+function usePrefersReducedMotion() {
+  const [reduced, setReduced] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    setReduced(mq.matches);
+    const handler = () => setReduced(mq.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  return reduced;
+}
+
+function TiltGlow({ children, style, tilt = 6, glow = true, scale = 1.012, disabled, onClick, ...rest }) {
+  const outerRef = useRef(null);
+  const glowRef = useRef(null);
+  const rafRef = useRef(null);
+  const reduced = usePrefersReducedMotion();
+  const active = !disabled && !reduced;
+
+  function handleMove(e) {
+    if (!active || !outerRef.current) return;
+    const rect = outerRef.current.getBoundingClientRect();
+    const px = (e.clientX - rect.left) / rect.width;
+    const py = (e.clientY - rect.top) / rect.height;
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      if (!outerRef.current) return;
+      const rotateY = (px - 0.5) * tilt * 2;
+      const rotateX = (0.5 - py) * tilt * 2;
+      outerRef.current.style.transform = `perspective(700px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) scale(${scale})`;
+      if (glow && glowRef.current) {
+        glowRef.current.style.background = `radial-gradient(circle at ${px * 100}% ${py * 100}%, var(--accent-soft), transparent 55%)`;
+      }
+    });
+  }
+  function handleEnter() { if (active && glowRef.current) glowRef.current.style.opacity = 1; }
+  function handleLeave() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (outerRef.current) outerRef.current.style.transform = "perspective(700px) rotateX(0deg) rotateY(0deg) scale(1)";
+    if (glowRef.current) glowRef.current.style.opacity = 0;
+  }
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
+
+  return (
+    <div
+      ref={outerRef}
+      onMouseMove={handleMove}
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+      onClick={onClick}
+      style={{ position: "relative", transition: "transform 260ms cubic-bezier(.2,.8,.2,1), box-shadow 200ms ease", willChange: "transform", ...style }}
+      {...rest}
+    >
+      {glow && (
+        <div
+          ref={glowRef}
+          style={{ position: "absolute", inset: 0, borderRadius: "inherit", pointerEvents: "none", opacity: 0, transition: "opacity 220ms ease", zIndex: 0 }}
+        />
+      )}
+      <div style={{ position: "relative", zIndex: 1 }}>{children}</div>
+    </div>
+  );
+}
+
 export default function GranolaApp() {
   const [session, setSession] = useState(undefined); // undefined = carregando
   const [profile, setProfile] = useState(null);
@@ -279,6 +350,7 @@ function useVoiceCall(profile) {
   const pcsRef = useRef({});
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
+  const screenSendersRef = useRef({}); // peerId -> [RTCRtpSender] dos tracks de tela
   const analyserRafRef = useRef(null);
   const audioCtxRef = useRef(null);
   const analysersRef = useRef({}); // id -> {analyser, data}
@@ -301,14 +373,22 @@ function useVoiceCall(profile) {
   function createPeerConnection(peerId) {
     const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
     localStreamRef.current?.getTracks().forEach((t) => pc.addTrack(t, localStreamRef.current));
-    screenStreamRef.current?.getTracks().forEach((t) => pc.addTrack(t, screenStreamRef.current));
+    if (screenStreamRef.current) {
+      const senders = screenStreamRef.current.getTracks().map((t) => pc.addTrack(t, screenStreamRef.current));
+      screenSendersRef.current[peerId] = senders;
+    }
 
     pc.onicecandidate = (e) => { if (e.candidate) sendSignal(peerId, { kind: "ice", candidate: e.candidate }); };
     pc.ontrack = (e) => {
       const stream = e.streams[0];
+      if (!stream) return;
+      // Se o stream tem vídeo, é a transmissão de tela (o áudio do sistema
+      // dela, se tiver, vem junto nesse mesmo stream). Se não tem vídeo,
+      // é o microfone. Assim o áudio da tela nunca substitui o do microfone.
+      const isScreenStream = stream.getVideoTracks().length > 0;
       setParticipants((p) => ({
         ...p,
-        [peerId]: { ...(p[peerId] || {}), ...(e.track.kind === "audio" ? { audioStream: stream } : { screenStream: stream }) },
+        [peerId]: { ...(p[peerId] || {}), ...(isScreenStream ? { screenStream: stream } : { audioStream: stream }) },
       }));
     };
     pc.onnegotiationneeded = async () => {
@@ -452,6 +532,7 @@ function useVoiceCall(profile) {
     localStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
+    screenSendersRef.current = {};
     if (channelRef.current) {
       await channelRef.current.untrack();
       supabase.removeChannel(channelRef.current);
@@ -475,9 +556,11 @@ function useVoiceCall(profile) {
   async function toggleShare() {
     if (localSharing) {
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
-      Object.values(pcsRef.current).forEach((pc) => {
-        pc.getSenders().filter((s) => s.track?.kind === "video").forEach((s) => pc.removeTrack(s));
+      Object.entries(screenSendersRef.current).forEach(([peerId, senders]) => {
+        const pc = pcsRef.current[peerId];
+        senders.forEach((s) => { try { pc?.removeTrack(s); } catch {} });
       });
+      screenSendersRef.current = {};
       screenStreamRef.current = null;
       setLocalSharing(false);
       return;
@@ -485,10 +568,13 @@ function useVoiceCall(profile) {
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
-        audio: false,
+        audio: { echoCancellation: true, noiseSuppression: false },
       });
       screenStreamRef.current = stream;
-      Object.values(pcsRef.current).forEach((pc) => stream.getTracks().forEach((t) => pc.addTrack(t, stream)));
+      Object.entries(pcsRef.current).forEach(([peerId, pc]) => {
+        const senders = stream.getTracks().map((t) => pc.addTrack(t, stream));
+        screenSendersRef.current[peerId] = senders;
+      });
       stream.getVideoTracks()[0].onended = () => toggleShare();
       setLocalSharing(true);
     } catch (err) { /* usuário cancelou a seleção de tela */ }
@@ -1646,7 +1732,9 @@ function HomeSidebar({ tab, onSelectTab, pendingCount }) {
 
   return (
     <div style={{ width: 260, flexShrink: 0, background: "#111114", borderRight: "1px solid #1e1e24", display: "flex", flexDirection: "column", padding: "18px 14px" }}>
-      <img src="/logo-full.png" alt="Granolas Place" style={{ width: "100%", maxWidth: 220, objectFit: "contain", marginBottom: 18 }} />
+      <TiltGlow tilt={4} glow={false} style={{ marginBottom: 18, borderRadius: 12 }}>
+        <img src="/logo-full.png" alt="Granolas Place" style={{ width: "100%", maxWidth: 220, objectFit: "contain", display: "block" }} />
+      </TiltGlow>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {navItems.map((item) => (
@@ -1658,18 +1746,24 @@ function HomeSidebar({ tab, onSelectTab, pendingCount }) {
 }
 
 function HomeNavItem({ active, onClick, icon, label }) {
+  const [hover, setHover] = useState(false);
   return (
     <button
       onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
       style={{
         display: "flex", alignItems: "center", gap: 12, padding: "10px 12px",
         borderRadius: 10, border: "none", cursor: "pointer", textAlign: "left",
-        background: active ? "var(--accent)" : "transparent",
+        background: active ? "var(--accent)" : hover ? "#1c1c22" : "transparent",
         color: active ? "#0a0a0d" : "#DFDCE6",
         fontWeight: active ? 700 : 600, fontSize: 14,
+        boxShadow: active ? "0 4px 16px -4px var(--accent-soft)" : "none",
+        transform: hover && !active ? "translateX(2px)" : "translateX(0)",
+        transition: "background 160ms ease, transform 160ms ease, box-shadow 200ms ease",
       }}
     >
-      <span style={{ fontSize: 15, width: 18, textAlign: "center" }}>{icon}</span>
+      <span style={{ fontSize: 15, width: 18, textAlign: "center", transition: "transform 160ms ease", transform: hover ? "scale(1.15)" : "scale(1)", display: "inline-block" }}>{icon}</span>
       {label}
     </button>
   );
@@ -1681,13 +1775,14 @@ function HomeNavItem({ active, onClick, icon, label }) {
 
 function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage }) {
   const [addValue, setAddValue] = useState("");
+  const [inputFocused, setInputFocused] = useState(false);
   const incoming = pending.filter((p) => p.isReceiver);
   const outgoing = pending.filter((p) => !p.isReceiver);
 
   return (
     <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "20px 24px 0", borderBottom: "1px solid #1e1e24", paddingBottom: 16 }}>
-        <div style={{ fontWeight: 700, fontSize: 16 }}>
+        <div style={{ fontWeight: 800, fontSize: 18, letterSpacing: -0.3 }}>
           {tab === "todos" && "Amigos"}
           {tab === "adicionar" && "Adicionar amigo"}
           {tab === "pendentes" && "Pedidos de amizade"}
@@ -1700,7 +1795,20 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewP
             onSubmit={(e) => { e.preventDefault(); if (addValue.trim()) { onAdd(addValue.trim()); setAddValue(""); } }}
             style={{ display: "flex", gap: 8, marginBottom: 20, maxWidth: 460 }}
           >
-            <input value={addValue} onChange={(e) => setAddValue(e.target.value)} placeholder="Adicionar amigo pelo username..." style={{ ...inputStyle, flex: 1 }} autoFocus />
+            <input
+              value={addValue}
+              onChange={(e) => setAddValue(e.target.value)}
+              onFocus={() => setInputFocused(true)}
+              onBlur={() => setInputFocused(false)}
+              placeholder="Adicionar amigo pelo username..."
+              style={{
+                ...inputStyle, flex: 1,
+                borderColor: inputFocused ? "var(--accent)" : "#2a2a32",
+                boxShadow: inputFocused ? "0 0 0 3px var(--accent-soft)" : "none",
+                transition: "border-color 160ms ease, box-shadow 160ms ease",
+              }}
+              autoFocus
+            />
             <button type="submit" style={{ ...primaryBtn, width: 140, marginTop: 0 }}>Enviar pedido</button>
           </form>
         )}
@@ -1712,17 +1820,7 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewP
         {tab === "pendentes" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {incoming.length === 0 && outgoing.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum pedido pendente.</div>}
-            {incoming.map((p) => (
-              <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px" }}>
-                <Avatar color={p.other.avatar_color} name={p.other.display_name} size={38} />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>{p.other.display_name}</div>
-                  <div style={{ fontSize: 12, color: "#8B8894" }}>quer ser seu amigo</div>
-                </div>
-                <button onClick={() => onRespond(p.id, "accepted")} style={{ ...primaryBtn, width: "auto", padding: "6px 14px", marginTop: 0, fontSize: 12.5 }}>Aceitar</button>
-                <button onClick={() => onRespond(p.id, "declined")} style={{ ...secondaryBtn, width: "auto", padding: "6px 14px", fontSize: 12.5 }}>Recusar</button>
-              </div>
-            ))}
+            {incoming.map((p) => <PendingRow key={p.id} p={p} onRespond={onRespond} />)}
             {outgoing.map((p) => (
               <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", opacity: 0.6 }}>
                 <Avatar color={p.other.avatar_color} name={p.other.display_name} size={38} />
@@ -1736,6 +1834,48 @@ function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewP
         )}
       </div>
     </div>
+  );
+}
+
+function PendingRow({ p, onRespond }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, background: hover ? "#141418" : "transparent", transition: "background 160ms ease" }}
+    >
+      <Avatar color={p.other.avatar_color} name={p.other.display_name} size={38} />
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 14, fontWeight: 700 }}>{p.other.display_name}</div>
+        <div style={{ fontSize: 12, color: "#8B8894" }}>quer ser seu amigo</div>
+      </div>
+      <HoverBtn onClick={() => onRespond(p.id, "accepted")} kind="primary">Aceitar</HoverBtn>
+      <HoverBtn onClick={() => onRespond(p.id, "declined")} kind="secondary">Recusar</HoverBtn>
+    </div>
+  );
+}
+
+function HoverBtn({ onClick, kind, children }) {
+  const [hover, setHover] = useState(false);
+  const primary = kind === "primary";
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        width: "auto", padding: "6px 14px", marginTop: 0, fontSize: 12.5, borderRadius: 8, cursor: "pointer",
+        border: primary ? "none" : "1px solid #2a2a32",
+        background: primary ? "var(--accent)" : hover ? "#22222a" : "#1c1c22",
+        color: primary ? "#0a0a0d" : "#F0EEF5",
+        transform: hover ? "translateY(-1px)" : "translateY(0)",
+        boxShadow: hover && primary ? "0 6px 16px -6px var(--accent-soft)" : "none",
+        transition: "transform 140ms ease, background 140ms ease, box-shadow 140ms ease",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -2359,28 +2499,46 @@ function FriendsGroupedList({ friends, onViewProfile, onMessage }) {
 
 function FriendRow({ f, onViewProfile, onMessage, dim }) {
   const statusMeta = STATUS_META[f.liveStatus] ?? STATUS_META.invisivel;
+  const [hover, setHover] = useState(false);
   return (
-    <div
+    <TiltGlow
+      tilt={dim ? 0 : 2.5}
+      disabled={dim}
       onClick={() => onViewProfile?.(f.id)}
-      style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer", opacity: dim ? 0.55 : 1 }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "#141418")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+      style={{
+        display: "block", borderRadius: 10, cursor: "pointer", opacity: dim ? 0.55 : 1,
+        background: hover ? "#15151a" : "transparent",
+        border: `1px solid ${hover && !dim ? "#26242c" : "transparent"}`,
+        boxShadow: hover && !dim ? "0 10px 24px -14px rgba(0,0,0,0.6)" : "none",
+      }}
     >
-      <Avatar color={f.avatar_color} name={f.display_name} status={dim ? null : f.liveStatus} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
-        <div style={{ fontSize: 12, color: dim ? "#5A5866" : (statusMeta.color ?? "#8B8894"), overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {f.custom_status || (dim ? "Offline" : statusMeta.label)}
-        </div>
-      </div>
-      <button
-        onClick={(e) => { e.stopPropagation(); onMessage?.(f.id); }}
-        title="Mandar mensagem"
-        style={{ background: "#1c1c22", border: "1px solid #2a2a32", color: "#F0EEF5", borderRadius: 8, padding: "6px 12px", fontSize: 12.5, cursor: "pointer", flexShrink: 0 }}
+      <div
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px" }}
       >
-        💬
-      </button>
-    </div>
+        <Avatar color={f.avatar_color} name={f.display_name} status={dim ? null : f.liveStatus} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
+          <div style={{ fontSize: 12, color: dim ? "#5A5866" : (statusMeta.color ?? "#8B8894"), overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {f.custom_status || (dim ? "Offline" : statusMeta.label)}
+          </div>
+        </div>
+        <button
+          onClick={(e) => { e.stopPropagation(); onMessage?.(f.id); }}
+          title="Mandar mensagem"
+          style={{
+            background: hover ? "var(--accent)" : "#1c1c22",
+            border: `1px solid ${hover ? "var(--accent)" : "#2a2a32"}`,
+            color: hover ? "#0a0a0d" : "#F0EEF5",
+            borderRadius: 8, padding: "6px 12px", fontSize: 12.5, cursor: "pointer", flexShrink: 0,
+            transition: "background 160ms ease, border-color 160ms ease, color 160ms ease",
+          }}
+        >
+          💬
+        </button>
+      </div>
+    </TiltGlow>
   );
 }
 
