@@ -189,8 +189,14 @@ export default function GranolaApp() {
           0%, 100% { transform: scale(1); }
           50% { transform: scale(1.045); }
         }
-        button, [role="button"] { transition: background-color 120ms ease, color 120ms ease, transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease; }
-        button:active { transform: scale(0.97); }
+        button, [role="button"] { transition: background-color 140ms ease, color 140ms ease, transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, filter 140ms ease; }
+        button:not(:disabled):hover { filter: brightness(1.14); }
+        button:not(:disabled):active { transform: scale(0.96); filter: brightness(0.96); }
+        button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        input:focus, textarea:focus { transition: border-color 160ms ease, box-shadow 160ms ease; }
+        @media (prefers-reduced-motion: reduce) {
+          button:not(:disabled):hover, button:not(:disabled):active { transform: none !important; }
+        }
       `}</style>
       {!session || !profile ? (
         <AuthScreen accent={accent} />
@@ -342,6 +348,7 @@ function useVoiceCall(profile) {
   const [joinedChannelId, setJoinedChannelId] = useState(null);
   const [participants, setParticipants] = useState({});
   const [localMuted, setLocalMuted] = useState(false);
+  const [deafened, setDeafened] = useState(false);
   const [localSharing, setLocalSharing] = useState(false);
   const [speakingIds, setSpeakingIds] = useState(() => new Set());
   const [localSpeaking, setLocalSpeaking] = useState(false);
@@ -553,6 +560,18 @@ function useVoiceCall(profile) {
     });
   }
 
+  function toggleDeafen() {
+    setDeafened((d) => {
+      const next = !d;
+      if (next && !localMuted) {
+        localStreamRef.current?.getAudioTracks().forEach((t) => (t.enabled = false));
+        setLocalMuted(true);
+        channelRef.current?.track(presencePayload(true));
+      }
+      return next;
+    });
+  }
+
   async function toggleShare() {
     if (localSharing) {
       screenStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -584,7 +603,7 @@ function useVoiceCall(profile) {
 
   return {
     joinedChannelId, participants, localMuted, localSharing, join, leave, toggleMute, toggleShare,
-    localScreenStream: screenStreamRef.current, speakingIds, localSpeaking,
+    localScreenStream: screenStreamRef.current, speakingIds, localSpeaking, deafened, toggleDeafen,
   };
 }
 
@@ -745,7 +764,11 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
             ref={(el) => {
               if (!el) return;
               if (el.srcObject !== p.audioStream) el.srcObject = p.audioStream;
-              el.volume = userVolumes[id] ?? 1;
+              try {
+                const v = userVolumes[id] ?? 1;
+                el.volume = Math.min(1, Math.max(0, v));
+                el.muted = call.deafened;
+              } catch (err) { console.warn("[volume] valor inválido:", err); }
             }}
           />
         ) : null
@@ -783,7 +806,15 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
               />
             )}
           </div>
-          <ProfileFooter profile={profile} onOpenProfile={() => setShowProfile(true)} />
+          {call.joinedChannelId && (
+            <VoiceConnectedBar
+              call={call}
+              channelName={channels.find((c) => c.id === call.joinedChannelId)?.name}
+              serverName={currentServer?.name}
+              onExpand={() => { setView("server"); setFullscreenCall(false); }}
+            />
+          )}
+          <ProfileFooter profile={profile} onOpenProfile={() => setShowProfile(true)} call={call} />
         </div>
       )}
 
@@ -851,17 +882,86 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   );
 }
 
-function ProfileFooter({ profile, onOpenProfile }) {
+function ProfileFooter({ profile, onOpenProfile, call }) {
   const statusMeta = STATUS_META[profile.status] ?? STATUS_META.online;
+  const inCall = !!call?.joinedChannelId;
   return (
-    <div onClick={onOpenProfile} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: "#111114", borderTop: "1px solid #1e1e24", borderRight: "1px solid #1e1e24", cursor: "pointer", flexShrink: 0 }}>
-      <Avatar color={profile.avatar_color} name={profile.display_name} status={profile.status} frame={profile.avatar_frame} avatarUrl={profile.avatar_url} customFrameUrl={profile.custom_frame_url} size={34} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{profile.display_name}</div>
-        <div style={{ fontSize: 11, color: statusMeta.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{profile.custom_status || statusMeta.label}</div>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", background: "#111114", borderTop: "1px solid #1e1e24", borderRight: "1px solid #1e1e24", flexShrink: 0 }}>
+      <div onClick={onOpenProfile} style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", flex: 1, minWidth: 0 }}>
+        <Avatar color={profile.avatar_color} name={profile.display_name} status={profile.status} frame={profile.avatar_frame} avatarUrl={profile.avatar_url} customFrameUrl={profile.custom_frame_url} size={34} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{profile.display_name}</div>
+          <div style={{ fontSize: 11, color: statusMeta.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{profile.custom_status || statusMeta.label}</div>
+        </div>
       </div>
-      <span style={{ color: "#8B8894", fontSize: 16 }}>⚙</span>
+      {inCall && (
+        <FooterIcon onClick={call.toggleMute} active={call.localMuted} title={call.localMuted ? "Ativar microfone" : "Silenciar"}>
+          {call.localMuted ? "🔇" : "🎤"}
+        </FooterIcon>
+      )}
+      {inCall && (
+        <FooterIcon onClick={call.toggleDeafen} active={call.deafened} title={call.deafened ? "Reativar áudio" : "Silenciar todo mundo"}>
+          {call.deafened ? "🙉" : "🎧"}
+        </FooterIcon>
+      )}
+      <FooterIcon onClick={onOpenProfile} title="Configurações">⚙</FooterIcon>
     </div>
+  );
+}
+
+function FooterIcon({ onClick, children, title, active }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        width: 30, height: 30, borderRadius: 8, border: "none", cursor: "pointer", fontSize: 14, flexShrink: 0,
+        background: active ? "#3a1c22" : "#1c1c22", color: active ? "#FF5470" : "#DFDCE6",
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function VoiceConnectedBar({ call, channelName, serverName, onExpand }) {
+  const count = 1 + Object.keys(call.participants).length;
+  return (
+    <div style={{ background: "#141418", borderTop: "1px solid #1e1e24", borderRight: "1px solid #1e1e24", padding: "10px 12px", flexShrink: 0 }}>
+      <div onClick={onExpand} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginBottom: 10 }}>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#3DDC84", flexShrink: 0, boxShadow: "0 0 8px 1px #3DDC8488" }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: "#3DDC84" }}>Voz conectada</div>
+          <div style={{ fontSize: 11, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {channelName ? `${channelName}${serverName ? ` / ${serverName}` : ""}` : `${count} na chamada`}
+          </div>
+        </div>
+        <button onClick={(e) => { e.stopPropagation(); call.leave(); }} title="Sair da chamada" style={{ background: "#3a1c22", border: "none", color: "#FF5470", width: 30, height: 30, borderRadius: 8, cursor: "pointer", fontSize: 14, flexShrink: 0 }}>
+          ✕
+        </button>
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <VoicePillBtn active={call.localSharing} onClick={call.toggleShare} title="Compartilhar tela">🖥</VoicePillBtn>
+        <VoicePillBtn active={false} onClick={onExpand} title="Expandir chamada">⛶</VoicePillBtn>
+      </div>
+    </div>
+  );
+}
+
+function VoicePillBtn({ active, onClick, title, children }) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        flex: 1, height: 32, borderRadius: 8, border: "none", cursor: "pointer", fontSize: 14,
+        background: active ? "var(--accent-soft)" : "#1c1c22",
+        color: active ? "var(--accent)" : "#8B8894",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -996,7 +1096,7 @@ function VoiceTile({ tile, onClick, big, thumb, volume, onSetVolume }) {
         >
           <div style={{ fontSize: 11, color: "#8B8894", marginBottom: 6 }}>Volume de {tile.name.split(" ")[0]}</div>
           <input
-            type="range" min={0} max={2} step={0.05}
+            type="range" min={0} max={1} step={0.02}
             value={volume ?? 1}
             onChange={(e) => onSetVolume(parseFloat(e.target.value))}
             style={{ width: "100%" }}
@@ -1037,10 +1137,32 @@ function ServerRail({ servers, currentServerId, onHome, onSelect, onCreate, onJo
 const railAddBtn = { width: 46, height: 46, borderRadius: 16, border: "1px dashed #34323c", background: "transparent", color: "#8B8894", fontSize: 20, cursor: "pointer" };
 
 function RailIcon({ active, onClick, children, label }) {
+  const [hover, setHover] = useState(false);
   return (
-    <button onClick={onClick} title={label} style={{ position: "relative", width: 46, height: 46, borderRadius: active ? 15 : 23, background: active ? "var(--accent)" : "#1c1c22", color: active ? "#0a0a0d" : "#F0EEF5", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "border-radius 160ms ease, background 160ms ease" }}>
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title={label}
+      style={{
+        position: "relative", width: 46, height: 46,
+        borderRadius: active ? 15 : hover ? 17 : 23,
+        background: active ? "var(--accent)" : hover ? "#25232c" : "#1c1c22",
+        color: active ? "#0a0a0d" : "#F0EEF5", border: "none", cursor: "pointer",
+        display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden",
+        boxShadow: active ? "0 6px 18px -6px var(--accent-soft)" : "none",
+        transform: hover && !active ? "translateY(-2px)" : "translateY(0)",
+        transition: "border-radius 200ms cubic-bezier(.34,1.56,.64,1), background 160ms ease, transform 160ms ease, box-shadow 200ms ease",
+      }}
+    >
       {children}
-      {active && <span style={{ position: "absolute", left: -14, top: "50%", transform: "translateY(-50%)", width: 4, height: 22, borderRadius: 4, background: "var(--accent)" }} />}
+      <span style={{
+        position: "absolute", left: -14, top: "50%", transform: "translateY(-50%)",
+        width: 4, borderRadius: 4, background: "#F0EEF5",
+        height: active ? 22 : hover ? 10 : 0,
+        opacity: active ? 1 : hover ? 0.8 : 0,
+        transition: "height 180ms ease, opacity 180ms ease",
+      }} />
     </button>
   );
 }
@@ -1239,20 +1361,23 @@ function MembersPanel({ server, profile, onViewProfile }) {
 function MemberRow({ member, onClick, isYou, dim, tagLabel }) {
   const statusMeta = STATUS_META[member.liveStatus] ?? STATUS_META.invisivel;
   const nameColor = !dim && member.topRole ? member.topRole.color : undefined;
+  const [hover, setHover] = useState(false);
   return (
-    <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, cursor: "pointer", opacity: dim ? 0.5 : 1 }}>
-      <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5, color: nameColor }}>
-          {!dim && member.topRole?.icon_url && <img src={member.topRole.icon_url} alt="" style={{ width: 13, height: 13, borderRadius: 3, flexShrink: 0 }} />}
-          {member.display_name}{isYou ? " (você)" : ""}
-          {member.showTag && tagLabel && (
-            <span style={{ fontSize: 9, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{tagLabel}</span>
-          )}
+    <TiltGlow tilt={dim ? 0 : 2} disabled={dim} onClick={onClick} style={{ borderRadius: 8, opacity: dim ? 0.5 : 1, background: hover ? "#17171c" : "transparent" }}>
+      <div onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", cursor: "pointer" }}>
+        <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5, color: nameColor }}>
+            {!dim && member.topRole?.icon_url && <img src={member.topRole.icon_url} alt="" style={{ width: 13, height: 13, borderRadius: 3, flexShrink: 0 }} />}
+            {member.display_name}{isYou ? " (você)" : ""}
+            {member.showTag && tagLabel && (
+              <span style={{ fontSize: 9, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{tagLabel}</span>
+            )}
+          </div>
+          {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
         </div>
-        {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
       </div>
-    </div>
+    </TiltGlow>
   );
 }
 
@@ -1539,9 +1664,23 @@ function ChannelGroupLabel({ children, style }) {
 }
 
 function ChannelRow({ active, onClick, icon, label }) {
+  const [hover, setHover] = useState(false);
   return (
-    <div onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, cursor: "pointer", fontSize: 13.5, fontWeight: active ? 600 : 500, color: active ? "#F0EEF5" : "#9a97a3", background: active ? "#1e1e26" : "transparent" }}>
-      <span style={{ opacity: 0.7, fontSize: 12, width: 14, textAlign: "center" }}>{icon}</span>{label}
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, cursor: "pointer",
+        fontSize: 13.5, fontWeight: active ? 600 : 500,
+        color: active ? "#F0EEF5" : hover ? "#DFDCE6" : "#9a97a3",
+        background: active ? "#1e1e26" : hover ? "#17171c" : "transparent",
+        transform: hover && !active ? "translateX(2px)" : "translateX(0)",
+        transition: "background 140ms ease, color 140ms ease, transform 140ms ease",
+      }}
+    >
+      <span style={{ opacity: active ? 1 : 0.7, fontSize: 12, width: 14, textAlign: "center", transform: hover ? "scale(1.15)" : "scale(1)", transition: "transform 140ms ease", display: "inline-block" }}>{icon}</span>
+      {label}
     </div>
   );
 }
@@ -1659,7 +1798,12 @@ function ChatArea({ channel, profile, onViewProfile }) {
           const authorName = m.profiles?.display_name ?? "Alguém";
           const authorColor = m.profiles?.avatar_color ?? "#8B5CF6";
           return (
-            <div key={m.id} style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14 }}>
+            <div
+              key={m.id}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "#121216")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14, padding: "2px 8px", margin: grouped ? "2px -8px 0" : "14px -8px 0", borderRadius: 8, transition: "background 120ms ease" }}
+            >
               <div style={{ width: 38, flexShrink: 0 }}>
                 {!grouped && (
                   <div onClick={() => onViewProfile?.(m.author_id)} style={{ cursor: "pointer" }}>
