@@ -587,7 +587,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   async function loadFriends() {
     const { data, error } = await supabase
       .from("friend_requests")
-      .select("*, sender:sender_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status), receiver:receiver_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status)")
+      .select("*, sender:sender_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status, bio, banner_from, banner_to, banner_gif_url, full_gradient, created_at, status), receiver:receiver_id(id, username, display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url, custom_status, bio, banner_from, banner_to, banner_gif_url, full_gradient, created_at, status)")
       .or(`sender_id.eq.${profile.id},receiver_id.eq.${profile.id}`);
     if (error) { console.error(error); return; }
     const accepted = [];
@@ -647,10 +647,22 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
     setShowJoinServer(false);
   }
 
+  const [userVolumes, setUserVolumes] = useState({});
+
   return (
     <div style={{ display: "flex", width: "100%", height: "100%" }}>
       {Object.entries(call.participants).map(([id, p]) => (
-        p.audioStream ? <audio key={id} autoPlay ref={(el) => { if (el && el.srcObject !== p.audioStream) el.srcObject = p.audioStream; }} /> : null
+        p.audioStream ? (
+          <audio
+            key={id}
+            autoPlay
+            ref={(el) => {
+              if (!el) return;
+              if (el.srcObject !== p.audioStream) el.srcObject = p.audioStream;
+              el.volume = userVolumes[id] ?? 1;
+            }}
+          />
+        ) : null
       ))}
 
       {!fullscreenCall && (
@@ -696,6 +708,8 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           profile={profile}
           fullscreen={fullscreenCall}
           onToggleFullscreen={() => setFullscreenCall((f) => !f)}
+          userVolumes={userVolumes}
+          onSetUserVolume={(id, v) => setUserVolumes((prev) => ({ ...prev, [id]: v }))}
         />
       ) : view === "home" ? (
         homeTab === "mensagens" ? (
@@ -765,13 +779,8 @@ function ProfileFooter({ profile, onOpenProfile }) {
   );
 }
 
-function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) {
-  const localVideoRef = useRef(null);
+function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, userVolumes, onSetUserVolume }) {
   const [pinnedId, setPinnedId] = useState(null);
-
-  useEffect(() => {
-    if (localVideoRef.current && call.localScreenStream) localVideoRef.current.srcObject = call.localScreenStream;
-  }, [call.localSharing]);
 
   const tiles = [
     {
@@ -782,7 +791,7 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
       avatarUrl: profile.avatar_url,
       customFrameUrl: profile.custom_frame_url,
       isVideo: call.localSharing,
-      videoRef: localVideoRef,
+      localStream: call.localScreenStream,
       isLocal: true,
       muted: call.localMuted,
       speaking: call.localSpeaking,
@@ -821,13 +830,13 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
         {pinnedTile ? (
           <>
             <div style={{ flex: 1, minHeight: 0 }}>
-              <VoiceTile tile={pinnedTile} big onClick={() => setPinnedId(null)} />
+              <VoiceTile tile={pinnedTile} big onClick={() => setPinnedId(null)} volume={userVolumes[pinnedTile.id]} onSetVolume={(v) => onSetUserVolume(pinnedTile.id, v)} />
             </div>
             {otherTiles.length > 0 && (
               <div style={{ display: "flex", gap: 10, overflowX: "auto", flexShrink: 0 }}>
                 {otherTiles.map((t) => (
                   <div key={t.id} style={{ width: 160, flexShrink: 0 }}>
-                    <VoiceTile tile={t} onClick={() => setPinnedId(t.id)} thumb />
+                    <VoiceTile tile={t} onClick={() => setPinnedId(t.id)} thumb volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />
                   </div>
                 ))}
               </div>
@@ -835,7 +844,7 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
           </>
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
-            {tiles.map((t) => <VoiceTile key={t.id} tile={t} onClick={() => setPinnedId(t.id)} />)}
+            {tiles.map((t) => <VoiceTile key={t.id} tile={t} onClick={() => setPinnedId(t.id)} volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />)}
           </div>
         )}
       </div>
@@ -851,11 +860,18 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen }) 
   );
 }
 
-function VoiceTile({ tile, onClick, big, thumb }) {
+function VoiceTile({ tile, onClick, big, thumb, volume, onSetVolume }) {
+  const [showVolume, setShowVolume] = useState(false);
+
   return (
     <div
       onClick={onClick}
-      title="Clique pra destacar"
+      onContextMenu={(e) => {
+        if (tile.isLocal) return;
+        e.preventDefault();
+        setShowVolume((v) => !v);
+      }}
+      title={tile.isLocal ? "Clique pra destacar" : "Clique pra destacar · botão direito pra ajustar volume"}
       style={{
         position: "relative", borderRadius: 12, overflow: "hidden", cursor: "pointer",
         background: tile.isVideo ? "#000" : `linear-gradient(135deg, ${tile.color}, #1c1c22)`,
@@ -869,15 +885,14 @@ function VoiceTile({ tile, onClick, big, thumb }) {
       }}
     >
       {tile.isVideo ? (
-        tile.isLocal ? (
-          <video ref={tile.videoRef} autoPlay muted playsInline style={{ width: "100%", height: "100%", objectFit: "contain" }} />
-        ) : (
-          <video
-            autoPlay playsInline
-            ref={(el) => { if (el && tile.screenStream && el.srcObject !== tile.screenStream) el.srcObject = tile.screenStream; }}
-            style={{ width: "100%", height: "100%", objectFit: "contain" }}
-          />
-        )
+        <video
+          autoPlay muted={tile.isLocal} playsInline
+          ref={(el) => {
+            const stream = tile.isLocal ? tile.localStream : tile.screenStream;
+            if (el && stream && el.srcObject !== stream) el.srcObject = stream;
+          }}
+          style={{ width: "100%", height: "100%", objectFit: "contain" }}
+        />
       ) : (
         <Avatar color={tile.color} name={tile.name} frame={tile.frame} avatarUrl={tile.avatarUrl} customFrameUrl={tile.customFrameUrl} size={thumb ? 40 : big ? 96 : 72} speaking={tile.speaking && !tile.muted} grayedOut={tile.muted} />
       )}
@@ -885,6 +900,22 @@ function VoiceTile({ tile, onClick, big, thumb }) {
         <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,10,13,0.75)", padding: "5px 11px", borderRadius: 8, fontSize: 12.5, fontWeight: 700, display: "flex", alignItems: "center", gap: 6, maxWidth: "calc(100% - 20px)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {tile.name}
           {tile.muted && <span style={{ fontSize: 11 }}>🔇</span>}
+        </div>
+      )}
+      {showVolume && !tile.isLocal && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+          style={{ position: "absolute", top: 10, right: 10, background: "#141418", border: "1px solid #26242c", borderRadius: 10, padding: "10px 12px", width: 160, boxShadow: "0 10px 24px -8px rgba(0,0,0,0.6)" }}
+        >
+          <div style={{ fontSize: 11, color: "#8B8894", marginBottom: 6 }}>Volume de {tile.name.split(" ")[0]}</div>
+          <input
+            type="range" min={0} max={2} step={0.05}
+            value={volume ?? 1}
+            onChange={(e) => onSetVolume(parseFloat(e.target.value))}
+            style={{ width: "100%" }}
+          />
+          <div style={{ fontSize: 10.5, color: "#5A5866", textAlign: "right" }}>{Math.round((volume ?? 1) * 100)}%</div>
         </div>
       )}
     </div>
@@ -1071,12 +1102,42 @@ function MembersPanel({ server, profile, onViewProfile }) {
   const online = members.filter((m) => m.liveStatus && m.liveStatus !== "offline" && m.liveStatus !== "invisivel");
   const offline = members.filter((m) => !m.liveStatus || m.liveStatus === "offline" || m.liveStatus === "invisivel");
 
+  // Agrupa os online por cargo (Dono primeiro, depois cada cargo, depois sem cargo)
+  const ownerGroup = online.filter((m) => m.id === server.owner_id);
+  const roleGroups = {};
+  const noRole = [];
+  online.forEach((m) => {
+    if (m.id === server.owner_id) return;
+    if (m.topRole) {
+      if (!roleGroups[m.topRole.id]) roleGroups[m.topRole.id] = { role: m.topRole, members: [] };
+      roleGroups[m.topRole.id].members.push(m);
+    } else {
+      noRole.push(m);
+    }
+  });
+  const orderedRoleGroups = Object.values(roleGroups).sort((a, b) => b.role.position - a.role.position);
+
   return (
     <div style={{ width: 220, flexShrink: 0, background: "#111114", borderLeft: "1px solid #1e1e24", overflowY: "auto", padding: "16px 12px" }}>
-      {online.length > 0 && (
+      {ownerGroup.length > 0 && (
         <>
-          <ChannelGroupLabel>Online — {online.length}</ChannelGroupLabel>
-          {online.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
+          <ChannelGroupLabel>🏆 Dono — {ownerGroup.length}</ChannelGroupLabel>
+          {ownerGroup.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
+        </>
+      )}
+      {orderedRoleGroups.map((g) => (
+        <div key={g.role.id}>
+          <ChannelGroupLabel style={{ marginTop: 16 }}>
+            {g.role.icon_url ? <img src={g.role.icon_url} alt="" style={{ width: 12, height: 12, borderRadius: 3, verticalAlign: -2, marginRight: 3 }} /> : null}
+            {g.role.name} — {g.members.length}
+          </ChannelGroupLabel>
+          {g.members.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
+        </div>
+      ))}
+      {noRole.length > 0 && (
+        <>
+          <ChannelGroupLabel style={{ marginTop: 16 }}>Membros — {noRole.length}</ChannelGroupLabel>
+          {noRole.map((m) => <MemberRow key={m.id} member={m} tagLabel={server.tag_label} onClick={() => onViewProfile(m.id)} isYou={m.id === profile.id} />)}
         </>
       )}
       {offline.length > 0 && (
@@ -1097,15 +1158,13 @@ function MemberRow({ member, onClick, isYou, dim, tagLabel }) {
       <Avatar color={member.avatar_color} name={member.display_name} status={dim ? null : member.liveStatus} frame={member.avatar_frame} avatarUrl={member.avatar_url} customFrameUrl={member.custom_frame_url} size={30} />
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5, color: nameColor }}>
+          {!dim && member.topRole?.icon_url && <img src={member.topRole.icon_url} alt="" style={{ width: 13, height: 13, borderRadius: 3, flexShrink: 0 }} />}
           {member.display_name}{isYou ? " (você)" : ""}
           {member.showTag && tagLabel && (
             <span style={{ fontSize: 9, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 4, padding: "1px 4px", flexShrink: 0 }}>{tagLabel}</span>
           )}
         </div>
-        {!dim && member.topRole && (
-          <div style={{ fontSize: 10, color: member.topRole.color, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.topRole.name}</div>
-        )}
-        {!dim && !member.topRole && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
+        {!dim && member.custom_status && <div style={{ fontSize: 10.5, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.custom_status}</div>}
       </div>
     </div>
   );
@@ -1176,15 +1235,34 @@ function RolesManager({ server }) {
     load();
   }
 
+  async function handleRoleIcon(roleId, e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const path = `role-icons/${roleId}-${Date.now()}-${file.name.replace(/[^\w.\-]/g, "_")}`;
+    const { error: upErr } = await supabase.storage.from("attachments").upload(path, file);
+    if (upErr) { alert("Não deu pra enviar: " + upErr.message); return; }
+    const { data: pub } = supabase.storage.from("attachments").getPublicUrl(path);
+    await supabase.from("roles").update({ icon_url: pub.publicUrl }).eq("id", roleId);
+    load();
+  }
+
   return (
     <div>
-      <div style={{ fontSize: 11.5, color: "#8B8894", marginBottom: 8, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.4 }}>Cargos</div>
+      <div style={{ fontSize: 11.5, color: "#8B8894", marginBottom: 2, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.4 }}>Cargos</div>
+      <div style={{ fontSize: 11, color: "#5A5866", marginBottom: 8 }}>Clica na bolinha do cargo pra colocar uma imagem nele.</div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
         {roles.map((r) => (
           <div key={r.id}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, background: "#17171c" }}>
-              <span style={{ width: 10, height: 10, borderRadius: "50%", background: r.color, flexShrink: 0 }} />
+              <label style={{ cursor: "pointer", flexShrink: 0 }}>
+                {r.icon_url ? (
+                  <img src={r.icon_url} alt="" style={{ width: 18, height: 18, borderRadius: 5, objectFit: "cover", display: "block" }} />
+                ) : (
+                  <span style={{ width: 10, height: 10, borderRadius: "50%", background: r.color, display: "block" }} />
+                )}
+                <input type="file" accept="image/*" onChange={(e) => handleRoleIcon(r.id, e)} style={{ display: "none" }} />
+              </label>
               <span style={{ flex: 1, fontSize: 13, fontWeight: 700, color: r.color }}>{r.name}</span>
               <span style={{ fontSize: 11, color: "#5A5866" }}>{memberRoleMap[r.id]?.size || 0} membro(s)</span>
               <button onClick={() => setExpandedRole(expandedRole === r.id ? null : r.id)} style={{ background: "transparent", border: "none", color: "#8B8894", cursor: "pointer", fontSize: 12 }}>
@@ -1968,34 +2046,47 @@ function ProfileModal({ profile, onSave, onClose, onLogout }) {
    no modo de pré-visualização dentro do editor de perfil)
 --------------------------------------------------------- */
 
-function ProfileCardBody({ data }) {
+function ProfileCardBody({ data, width = 340 }) {
   const bannerCss = data.banner_to
     ? `linear-gradient(120deg, ${data.banner_from}, ${data.banner_to})`
     : `linear-gradient(120deg, ${data.banner_from || data.avatar_color}, #1c1c22 80%)`;
-  const bannerStyle = data.banner_gif_url
+  const bannerBgStyle = data.banner_gif_url
     ? { backgroundImage: `url(${data.banner_gif_url})`, backgroundSize: "cover", backgroundPosition: "center" }
     : { background: bannerCss };
+  const fullGradient = !!data.full_gradient && !!data.banner_gif_url;
+  const memberSince = data.created_at
+    ? new Date(data.created_at).toLocaleDateString("pt-BR", { day: "2-digit", month: "short", year: "numeric" })
+    : null;
 
   return (
-    <div style={{ width: 340, borderRadius: 16, overflow: "hidden" }}>
-      <div style={{ height: 90, ...bannerStyle }} />
-      <div style={{ padding: "0 20px 20px", marginTop: -32 }}>
-        <Avatar color={data.avatar_color} name={data.display_name} status={data.status} frame={data.avatar_frame} avatarUrl={data.avatar_url} customFrameUrl={data.custom_frame_url} size={64} />
-        <div style={{ marginTop: 8 }}>
-          <div style={{ fontSize: 17, fontWeight: 800 }}>{data.display_name}</div>
-          <div style={{ fontSize: 12.5, color: "#8B8894" }}>@{data.username}</div>
+    <div style={{ width, borderRadius: 16, overflow: "hidden", position: "relative", ...(fullGradient ? bannerBgStyle : {}) }}>
+      {fullGradient && <div style={{ position: "absolute", inset: 0, background: "rgba(10,10,13,0.55)" }} />}
+      <div style={{ position: "relative" }}>
+        <div style={{ height: 90, ...(!fullGradient ? bannerBgStyle : {}) }} />
+        <div style={{ padding: "0 20px 20px", marginTop: -32 }}>
+          <Avatar color={data.avatar_color} name={data.display_name} status={data.status} frame={data.avatar_frame} avatarUrl={data.avatar_url} customFrameUrl={data.custom_frame_url} size={64} />
+          <div style={{ marginTop: 8 }}>
+            <div style={{ fontSize: 17, fontWeight: 800 }}>{data.display_name}</div>
+            <div style={{ fontSize: 12.5, color: "#8B8894" }}>@{data.username}</div>
+          </div>
+          {data.custom_status && (
+            <div style={{ marginTop: 10, fontSize: 12.5, color: STATUS_META[data.status]?.color ?? "#8B8894", display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: STATUS_META[data.status]?.color ?? "#5A5866", display: "inline-block" }} />
+              {data.custom_status}
+            </div>
+          )}
+          {data.bio && (
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #26242c", fontSize: 13, color: "#DFDCE6", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+              {data.bio}
+            </div>
+          )}
+          {memberSince && (
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #26242c" }}>
+              <div style={{ fontSize: 10.5, color: "#8B8894", fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Membro desde</div>
+              <div style={{ fontSize: 12.5 }}>{memberSince}</div>
+            </div>
+          )}
         </div>
-        {data.custom_status && (
-          <div style={{ marginTop: 10, fontSize: 12.5, color: STATUS_META[data.status]?.color ?? "#8B8894", display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: STATUS_META[data.status]?.color ?? "#5A5866", display: "inline-block" }} />
-            {data.custom_status}
-          </div>
-        )}
-        {data.bio && (
-          <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid #26242c", fontSize: 13, color: "#DFDCE6", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
-            {data.bio}
-          </div>
-        )}
       </div>
     </div>
   );
@@ -2144,6 +2235,7 @@ function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onVie
 function DMChatArea({ friend, profile, onBack, onViewProfile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
+  const [showPanel, setShowPanel] = useState(true);
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -2182,38 +2274,46 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
   }
 
   return (
-    <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0a0a0d", minWidth: 0 }}>
-      <div style={{ padding: "12px 20px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", gap: 10 }}>
-        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 16, cursor: "pointer" }}>←</button>
-        <div onClick={() => onViewProfile?.(friend.id)} style={{ cursor: "pointer" }}>
-          <Avatar color={friend.avatar_color} name={friend.display_name} frame={friend.avatar_frame} avatarUrl={friend.avatar_url} customFrameUrl={friend.custom_frame_url} size={30} />
+    <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0a0a0d", minWidth: 0 }}>
+        <div style={{ padding: "12px 20px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", gap: 10 }}>
+          <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 16, cursor: "pointer" }}>←</button>
+          <div onClick={() => onViewProfile?.(friend.id)} style={{ cursor: "pointer" }}>
+            <Avatar color={friend.avatar_color} name={friend.display_name} frame={friend.avatar_frame} avatarUrl={friend.avatar_url} customFrameUrl={friend.custom_frame_url} size={30} />
+          </div>
+          <div style={{ fontWeight: 700, fontSize: 14.5, flex: 1 }}>{friend.display_name}</div>
+          <button onClick={() => setShowPanel((v) => !v)} title="Perfil" style={{ background: "transparent", border: "none", color: showPanel ? "var(--accent)" : "#8B8894", fontSize: 16, cursor: "pointer" }}>ⓘ</button>
         </div>
-        <div style={{ fontWeight: 700, fontSize: 14.5 }}>{friend.display_name}</div>
-      </div>
 
-      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
-        {messages.length === 0 && <div style={{ color: "#5A5866", fontSize: 13.5, marginTop: 20 }}>Comece a conversa com {friend.display_name}.</div>}
-        {messages.map((m, i) => {
-          const isMe = m.sender_id === profile.id;
-          const prev = messages[i - 1];
-          const grouped = prev && prev.sender_id === m.sender_id;
-          return (
-            <div key={m.id} style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14 }}>
-              <div style={{ width: 38, flexShrink: 0 }}>
-                {!grouped && <Avatar color={isMe ? profile.avatar_color : friend.avatar_color} name={isMe ? profile.display_name : friend.display_name} frame={isMe ? profile.avatar_frame : friend.avatar_frame} avatarUrl={isMe ? profile.avatar_url : friend.avatar_url} customFrameUrl={isMe ? profile.custom_frame_url : friend.custom_frame_url} size={38} />}
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                {!grouped && (
-                  <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-                    <span style={{ fontWeight: 700, fontSize: 13.5 }}>{isMe ? profile.display_name : friend.display_name}</span>
-                    <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
-                  </div>
-                )}
-                <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>
-              </div>
+        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 20px" }}>
+          {messages.length === 0 && (
+            <div style={{ marginBottom: 10, marginTop: 4 }}>
+              <Avatar color={friend.avatar_color} name={friend.display_name} frame={friend.avatar_frame} avatarUrl={friend.avatar_url} customFrameUrl={friend.custom_frame_url} size={56} />
+              <div style={{ fontWeight: 800, fontSize: 19, marginTop: 10 }}>{friend.display_name}</div>
+              <div style={{ color: "#5A5866", fontSize: 13, marginTop: 4 }}>Este é o começo da sua conversa com {friend.display_name}.</div>
             </div>
-          );
-        })}
+          )}
+          {messages.map((m, i) => {
+            const isMe = m.sender_id === profile.id;
+            const prev = messages[i - 1];
+            const grouped = prev && prev.sender_id === m.sender_id;
+            return (
+              <div key={m.id} style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14 }}>
+                <div style={{ width: 38, flexShrink: 0 }}>
+                  {!grouped && <Avatar color={isMe ? profile.avatar_color : friend.avatar_color} name={isMe ? profile.display_name : friend.display_name} frame={isMe ? profile.avatar_frame : friend.avatar_frame} avatarUrl={isMe ? profile.avatar_url : friend.avatar_url} customFrameUrl={isMe ? profile.custom_frame_url : friend.custom_frame_url} size={38} />}
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  {!grouped && (
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                      <span style={{ fontWeight: 700, fontSize: 13.5 }}>{isMe ? profile.display_name : friend.display_name}</span>
+                      <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
+                    </div>
+                  )}
+                  <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>
+                </div>
+              </div>
+            );
+          })}
       </div>
 
       <div style={{ padding: "0 20px 18px" }}>
@@ -2222,6 +2322,18 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
           <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
         </form>
       </div>
+      </div>
+
+      {showPanel && <DMProfilePanel friend={friend} onViewProfile={onViewProfile} />}
+    </div>
+  );
+}
+
+function DMProfilePanel({ friend, onViewProfile }) {
+  return (
+    <div style={{ width: 280, flexShrink: 0, background: "#111114", borderLeft: "1px solid #1e1e24", padding: 16, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+      <ProfileCardBody data={friend} width={248} />
+      <button onClick={() => onViewProfile?.(friend.id)} style={{ ...secondaryBtn, width: "100%", marginTop: 4 }}>Ver perfil completo</button>
     </div>
   );
 }
