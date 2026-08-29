@@ -68,6 +68,21 @@ function timeFmt(iso) {
   return new Date(iso).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 }
 
+function renderMentions(content, myUsername) {
+  const parts = content.split(/(@[a-zA-Z0-9_]+)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("@")) {
+      const isMe = myUsername && part.slice(1).toLowerCase() === myUsername.toLowerCase();
+      return (
+        <span key={i} style={{ background: isMe ? "var(--accent)" : "var(--accent-soft)", color: isMe ? "#0a0a0d" : "var(--accent)", fontWeight: 700, borderRadius: 4, padding: "0 3px" }}>
+          {part}
+        </span>
+      );
+    }
+    return part;
+  });
+}
+
 /* ---------------------------------------------------------
    App raiz — controla sessão de autenticação
 --------------------------------------------------------- */
@@ -636,12 +651,58 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   const [showServerSettings, setShowServerSettings] = useState(false);
   const [viewingUserId, setViewingUserId] = useState(null);
   const [fullscreenCall, setFullscreenCall] = useState(false);
+  const [unreadChannels, setUnreadChannels] = useState({}); // channelId -> "mention" | "message"
+  const [unreadDms, setUnreadDms] = useState({}); // friendId -> "mention" | "message"
   const call = useVoiceCall(profile);
   const friendIds = new Set(friends.map((f) => f.id));
   const pendingIds = new Set(pending.map((p) => p.other.id));
 
   const currentServer = servers.find((s) => s.id === currentServerId);
   const currentChannel = channels.find((c) => c.id === currentChannelId);
+
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
+
+  function notify(title, body) {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    if (document.hasFocus()) return;
+    try { new Notification(title, { body, icon: "/logo-mark.png" }); } catch {}
+  }
+
+  // Fica de olho em mensagens novas nos canais do servidor aberto e nas DMs,
+  // pra marcar "não lido" e disparar notificação quando fizer sentido.
+  useEffect(() => {
+    const channelIds = new Set(channels.map((c) => c.id));
+
+    const msgSub = supabase
+      .channel(`unread-messages-${currentServerId || "none"}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (payload) => {
+        const msg = payload.new;
+        if (!channelIds.has(msg.channel_id)) return;
+        if (msg.author_id === profile.id) return;
+        const mentioned = msg.content && msg.content.includes(`@${profile.username}`);
+        if (msg.channel_id === currentChannelId && document.hasFocus()) return;
+        setUnreadChannels((prev) => ({ ...prev, [msg.channel_id]: mentioned ? "mention" : (prev[msg.channel_id] || "message") }));
+        if (mentioned) notify(`Você foi mencionado`, msg.content.slice(0, 120));
+      })
+      .subscribe();
+
+    const dmSub = supabase
+      .channel(`unread-dms-${profile.id}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "direct_messages", filter: `receiver_id=eq.${profile.id}` }, (payload) => {
+        const msg = payload.new;
+        if (msg.sender_id === dmFriendId && homeTab === "mensagens" && document.hasFocus()) return;
+        setUnreadDms((prev) => ({ ...prev, [msg.sender_id]: "message" }));
+        const sender = friends.find((f) => f.id === msg.sender_id);
+        notify(`Mensagem de ${sender?.display_name || "alguém"}`, msg.content?.slice(0, 120) || "Enviou um arquivo");
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(msgSub); supabase.removeChannel(dmSub); };
+  }, [channels, currentServerId, currentChannelId, dmFriendId, homeTab, friends, profile.id, profile.username]);
 
   useEffect(() => { loadServers(); loadFriends(); markPresence("online"); 
     const onUnload = () => markPresence("offline");
@@ -791,18 +852,18 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
                 tab={homeTab}
                 onSelectTab={setHomeTab}
                 pendingCount={pending.filter((p) => p.isReceiver).length}
-                onCreateServer={() => setShowCreateServer(true)}
-                onJoinServer={() => setShowJoinServer(true)}
+                dmUnreadCount={Object.keys(unreadDms).length}
               />
             ) : (
               <ChannelSidebar
                 server={currentServer}
                 channels={channels}
                 currentChannelId={currentChannelId}
-                onSelectChannel={setCurrentChannelId}
+                onSelectChannel={(id) => { setCurrentChannelId(id); setUnreadChannels((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
                 call={call}
                 onOpenSettings={() => setShowServerSettings(true)}
                 onCreateChannel={createChannel}
+                unreadChannels={unreadChannels}
               />
             )}
           </div>
@@ -827,12 +888,20 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
           onToggleFullscreen={() => setFullscreenCall((f) => !f)}
           userVolumes={userVolumes}
           onSetUserVolume={(id, v) => setUserVolumes((prev) => ({ ...prev, [id]: v }))}
+          onViewProfile={setViewingUserId}
         />
       ) : view === "home" ? (
         homeTab === "mensagens" ? (
-          <DirectMessagesView friends={friends} profile={profile} dmFriendId={dmFriendId} setDmFriendId={setDmFriendId} onViewProfile={setViewingUserId} />
+          <DirectMessagesView
+            friends={friends}
+            profile={profile}
+            dmFriendId={dmFriendId}
+            setDmFriendId={(id) => { setDmFriendId(id); if (id) setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
+            onViewProfile={setViewingUserId}
+            unreadDms={unreadDms}
+          />
         ) : (
-          <FriendsMain tab={homeTab} friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} onMessage={(id) => { setHomeTab("mensagens"); setDmFriendId(id); }} />
+          <FriendsMain friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} onMessage={(id) => { setHomeTab("mensagens"); setDmFriendId(id); setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }} />
         )
       ) : (
         <>
@@ -965,8 +1034,9 @@ function VoicePillBtn({ active, onClick, title, children }) {
   );
 }
 
-function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, userVolumes, onSetUserVolume }) {
+function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, userVolumes, onSetUserVolume, onViewProfile }) {
   const [pinnedId, setPinnedId] = useState(null);
+  const [showChat, setShowChat] = useState(false);
 
   const tiles = [
     {
@@ -1007,32 +1077,40 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, us
     <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "16px 24px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ fontWeight: 700, fontSize: 15 }}>🔊 {channel.name}</div>
-        <button onClick={onToggleFullscreen} style={{ ...secondaryBtn, width: "auto", padding: "7px 14px" }}>
-          {fullscreen ? "Sair da tela cheia" : "Tela cheia"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setShowChat((v) => !v)} style={{ ...secondaryBtn, width: "auto", padding: "7px 14px", background: showChat ? "var(--accent-soft)" : "#1c1c22", color: showChat ? "var(--accent)" : "#F0EEF5", border: showChat ? "1px solid var(--accent)" : "1px solid #2a2a32" }}>
+            💬 Chat
+          </button>
+          <button onClick={onToggleFullscreen} style={{ ...secondaryBtn, width: "auto", padding: "7px 14px" }}>
+            {fullscreen ? "Sair da tela cheia" : "Tela cheia"}
+          </button>
+        </div>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
-        {pinnedTile ? (
-          <>
-            <div style={{ flex: 1, minHeight: 0 }}>
-              <VoiceTile tile={pinnedTile} big onClick={() => setPinnedId(null)} volume={userVolumes[pinnedTile.id]} onSetVolume={(v) => onSetUserVolume(pinnedTile.id, v)} />
-            </div>
-            {otherTiles.length > 0 && (
-              <div style={{ display: "flex", gap: 10, overflowX: "auto", flexShrink: 0 }}>
-                {otherTiles.map((t) => (
-                  <div key={t.id} style={{ width: 160, flexShrink: 0 }}>
-                    <VoiceTile tile={t} onClick={() => setPinnedId(t.id)} thumb volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />
-                  </div>
-                ))}
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        <div style={{ flex: 1, overflow: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+          {pinnedTile ? (
+            <>
+              <div style={{ flex: 1, minHeight: 0 }}>
+                <VoiceTile tile={pinnedTile} big onClick={() => setPinnedId(null)} volume={userVolumes[pinnedTile.id]} onSetVolume={(v) => onSetUserVolume(pinnedTile.id, v)} />
               </div>
-            )}
-          </>
-        ) : (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
-            {tiles.map((t) => <VoiceTile key={t.id} tile={t} onClick={() => setPinnedId(t.id)} volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />)}
-          </div>
-        )}
+              {otherTiles.length > 0 && (
+                <div style={{ display: "flex", gap: 10, overflowX: "auto", flexShrink: 0 }}>
+                  {otherTiles.map((t) => (
+                    <div key={t.id} style={{ width: 160, flexShrink: 0 }}>
+                      <VoiceTile tile={t} onClick={() => setPinnedId(t.id)} thumb volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 14 }}>
+              {tiles.map((t) => <VoiceTile key={t.id} tile={t} onClick={() => setPinnedId(t.id)} volume={userVolumes[t.id]} onSetVolume={(v) => onSetUserVolume(t.id, v)} />)}
+            </div>
+          )}
+        </div>
+        {showChat && <CallChatPanel channel={channel} profile={profile} onViewProfile={onViewProfile} onClose={() => setShowChat(false)} />}
       </div>
 
       <div style={{ padding: 16, borderTop: "1px solid #1e1e24", display: "flex", justifyContent: "center" }}>
@@ -1041,6 +1119,81 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, us
           <ToolBtn active={call.localSharing} onClick={call.toggleShare} label="Compartilhar tela">🖥</ToolBtn>
           <ToolBtn active={false} onClick={call.leave} label="Sair" danger>✕ Sair</ToolBtn>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function CallChatPanel({ channel, profile, onViewProfile, onClose }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+  const scrollRef = useRef(null);
+
+  useEffect(() => {
+    let active = true;
+    loadMessages();
+    const sub = supabase
+      .channel(`callchat:${channel.id}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: `channel_id=eq.${channel.id}` }, () => loadMessages())
+      .subscribe();
+
+    async function loadMessages() {
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*, profiles(display_name, avatar_color, avatar_frame, avatar_url, custom_frame_url)")
+        .eq("channel_id", channel.id)
+        .order("created_at");
+      if (!active) return;
+      if (!error) setMessages(data || []);
+    }
+    return () => { active = false; supabase.removeChannel(sub); };
+  }, [channel.id]);
+
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight }); }, [messages.length]);
+
+  async function send(e) {
+    e.preventDefault();
+    if (!text.trim()) return;
+    const content = text;
+    setText("");
+    const { error } = await supabase.from("messages").insert({ channel_id: channel.id, author_id: profile.id, content });
+    if (error) alert(error.message);
+  }
+
+  return (
+    <div style={{ width: 300, flexShrink: 0, borderLeft: "1px solid #1e1e24", background: "#111114", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 14px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Chat da chamada</div>
+        <button onClick={onClose} style={{ background: "transparent", border: "none", color: "#8B8894", cursor: "pointer", fontSize: 14 }}>✕</button>
+      </div>
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+        {messages.length === 0 && <div style={{ color: "#5A5866", fontSize: 12, textAlign: "center", marginTop: 20 }}>Manda uma mensagem sem sair da chamada.</div>}
+        {messages.map((m, i) => {
+          const prev = messages[i - 1];
+          const grouped = prev && prev.author_id === m.author_id;
+          const authorName = m.profiles?.display_name ?? "Alguém";
+          return (
+            <div key={m.id} style={{ display: "flex", gap: 8, marginTop: grouped ? 2 : 12 }}>
+              <div style={{ width: 26, flexShrink: 0 }}>
+                {!grouped && (
+                  <div onClick={() => onViewProfile?.(m.author_id)} style={{ cursor: "pointer" }}>
+                    <Avatar color={m.profiles?.avatar_color ?? "#8B5CF6"} name={authorName} frame={m.profiles?.avatar_frame} avatarUrl={m.profiles?.avatar_url} customFrameUrl={m.profiles?.custom_frame_url} size={26} />
+                  </div>
+                )}
+              </div>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                {!grouped && <div style={{ fontSize: 11.5, fontWeight: 700 }}>{authorName}</div>}
+                <div style={{ fontSize: 12.5, color: "#DFDCE6", lineHeight: 1.4, wordBreak: "break-word" }}>{renderMentions(m.content, profile.username)}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ padding: "10px 12px" }}>
+        <form onSubmit={send} style={{ display: "flex", alignItems: "center", background: "#17171c", border: "1px solid #26242c", borderRadius: 10, padding: "3px 5px 3px 10px" }}>
+          <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Mensagem..." style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 12.5, padding: "8px 0" }} />
+          <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 7, width: 26, height: 26, cursor: "pointer", fontWeight: 800, fontSize: 12 }}>➤</button>
+        </form>
       </div>
     </div>
   );
@@ -1171,7 +1324,7 @@ function RailIcon({ active, onClick, children, label }) {
    Sidebar de canais
 --------------------------------------------------------- */
 
-function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel }) {
+function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel, unreadChannels }) {
   const [creatingType, setCreatingType] = useState(null);
   if (!server) return <div style={{ width: 240, background: "#111114" }} />;
   const textChannels = channels.filter((c) => c.type === "text");
@@ -1199,7 +1352,7 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
           <button onClick={() => setCreatingType("text")} title="Criar canal de texto" style={miniAddBtn}>+</button>
         </div>
         {textChannels.map((c) => (
-          <ChannelRow key={c.id} active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="#" label={c.name} />
+          <ChannelRow key={c.id} active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="#" label={c.name} unread={unreadChannels?.[c.id]} />
         ))}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
           <ChannelGroupLabel>Canais de voz</ChannelGroupLabel>
@@ -1663,7 +1816,7 @@ function ChannelGroupLabel({ children, style }) {
   return <div style={{ fontSize: 11, fontWeight: 700, color: "#5A5866", textTransform: "uppercase", letterSpacing: 0.6, padding: "4px 8px", ...style }}>{children}</div>;
 }
 
-function ChannelRow({ active, onClick, icon, label }) {
+function ChannelRow({ active, onClick, icon, label, unread }) {
   const [hover, setHover] = useState(false);
   return (
     <div
@@ -1672,15 +1825,18 @@ function ChannelRow({ active, onClick, icon, label }) {
       onMouseLeave={() => setHover(false)}
       style={{
         display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, cursor: "pointer",
-        fontSize: 13.5, fontWeight: active ? 600 : 500,
-        color: active ? "#F0EEF5" : hover ? "#DFDCE6" : "#9a97a3",
+        fontSize: 13.5, fontWeight: active || unread ? 600 : 500,
+        color: active ? "#F0EEF5" : unread ? "#F0EEF5" : hover ? "#DFDCE6" : "#9a97a3",
         background: active ? "#1e1e26" : hover ? "#17171c" : "transparent",
         transform: hover && !active ? "translateX(2px)" : "translateX(0)",
         transition: "background 140ms ease, color 140ms ease, transform 140ms ease",
       }}
     >
       <span style={{ opacity: active ? 1 : 0.7, fontSize: 12, width: 14, textAlign: "center", transform: hover ? "scale(1.15)" : "scale(1)", transition: "transform 140ms ease", display: "inline-block" }}>{icon}</span>
-      {label}
+      <span style={{ flex: 1 }}>{label}</span>
+      {unread && (
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: unread === "mention" ? "#FF9D4D" : "#FF5470", flexShrink: 0 }} />
+      )}
     </div>
   );
 }
@@ -1699,8 +1855,45 @@ function ChatArea({ channel, profile, onViewProfile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [serverMembers, setServerMembers] = useState([]);
+  const [mentionQuery, setMentionQuery] = useState(null); // string sendo digitada depois do @, ou null
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (!channel?.server_id) { setServerMembers([]); return; }
+    let active = true;
+    (async () => {
+      const { data: memberRows } = await supabase.from("server_members").select("user_id").eq("server_id", channel.server_id);
+      const ids = (memberRows || []).map((r) => r.user_id);
+      if (ids.length === 0) return;
+      const { data: profs } = await supabase.from("profiles").select("id, username, display_name, avatar_color").in("id", ids);
+      if (active) setServerMembers(profs || []);
+    })();
+    return () => { active = false; };
+  }, [channel?.server_id]);
+
+  const mentionMatches = mentionQuery === null ? [] : serverMembers.filter((m) =>
+    m.username.toLowerCase().startsWith(mentionQuery.toLowerCase()) || m.display_name.toLowerCase().startsWith(mentionQuery.toLowerCase())
+  ).slice(0, 6);
+
+  function handleTextChange(e) {
+    const val = e.target.value;
+    setText(val);
+    const upToCursor = val.slice(0, e.target.selectionStart ?? val.length);
+    const match = upToCursor.match(/(?:^|\s)@([a-zA-Z0-9_]*)$/);
+    setMentionQuery(match ? match[1] : null);
+  }
+
+  function pickMention(member) {
+    const cursor = inputRef.current?.selectionStart ?? text.length;
+    const before = text.slice(0, cursor).replace(/@([a-zA-Z0-9_]*)$/, `@${member.username} `);
+    const after = text.slice(cursor);
+    setText(before + after);
+    setMentionQuery(null);
+    inputRef.current?.focus();
+  }
 
   useEffect(() => {
     if (!channel || channel.type !== "text") { setMessages([]); return; }
@@ -1735,6 +1928,7 @@ function ChatArea({ channel, profile, onViewProfile }) {
     if (!text.trim() || !channel) return;
     const content = text;
     setText("");
+    setMentionQuery(null);
     const { error } = await supabase.from("messages").insert({ channel_id: channel.id, author_id: profile.id, content });
     if (error) alert(error.message);
   }
@@ -1797,12 +1991,18 @@ function ChatArea({ channel, profile, onViewProfile }) {
           const grouped = prev && prev.author_id === m.author_id;
           const authorName = m.profiles?.display_name ?? "Alguém";
           const authorColor = m.profiles?.avatar_color ?? "#8B5CF6";
+          const mentionsMe = m.content && profile.username && m.content.toLowerCase().includes(`@${profile.username.toLowerCase()}`);
           return (
             <div
               key={m.id}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "#121216")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              style={{ display: "flex", gap: 12, marginTop: grouped ? 2 : 14, padding: "2px 8px", margin: grouped ? "2px -8px 0" : "14px -8px 0", borderRadius: 8, transition: "background 120ms ease" }}
+              onMouseEnter={(e) => { if (!mentionsMe) e.currentTarget.style.background = "#121216"; }}
+              onMouseLeave={(e) => { if (!mentionsMe) e.currentTarget.style.background = "transparent"; }}
+              style={{
+                display: "flex", gap: 12, marginTop: grouped ? 2 : 14, padding: "2px 8px",
+                margin: grouped ? "2px -8px 0" : "14px -8px 0", borderRadius: 8, transition: "background 120ms ease",
+                background: mentionsMe ? "var(--accent-soft)" : "transparent",
+                borderLeft: mentionsMe ? "2px solid var(--accent)" : "2px solid transparent",
+              }}
             >
               <div style={{ width: 38, flexShrink: 0 }}>
                 {!grouped && (
@@ -1818,7 +2018,7 @@ function ChatArea({ channel, profile, onViewProfile }) {
                     <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
                   </div>
                 )}
-                {m.content && <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>}
+                {m.content && <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{renderMentions(m.content, profile.username)}</div>}
                 {m.attachments?.map((a) => <AttachmentView key={a.id} attachment={a} />)}
               </div>
             </div>
@@ -1826,13 +2026,38 @@ function ChatArea({ channel, profile, onViewProfile }) {
         })}
       </div>
 
-      <div style={{ padding: "0 20px 18px" }}>
+      <div style={{ padding: "0 20px 18px", position: "relative" }}>
+        {mentionMatches.length > 0 && (
+          <div style={{ position: "absolute", bottom: "100%", left: 0, right: 0, marginBottom: 8, background: "#17171c", border: "1px solid #26242c", borderRadius: 10, overflow: "hidden", boxShadow: "0 -8px 24px -10px rgba(0,0,0,0.6)" }}>
+            <div style={{ fontSize: 10.5, color: "#5A5866", fontWeight: 700, textTransform: "uppercase", padding: "8px 12px 4px" }}>Marcar alguém</div>
+            {mentionMatches.map((m) => (
+              <div
+                key={m.id}
+                onMouseDown={(e) => { e.preventDefault(); pickMention(m); }}
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", cursor: "pointer" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "#1e1e26")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              >
+                <Avatar color={m.avatar_color} name={m.display_name} size={22} />
+                <span style={{ fontSize: 13, fontWeight: 600 }}>{m.display_name}</span>
+                <span style={{ fontSize: 11.5, color: "#5A5866" }}>@{m.username}</span>
+              </div>
+            ))}
+          </div>
+        )}
         <form onSubmit={send} style={{ display: "flex", alignItems: "center", background: "#17171c", border: "1px solid #26242c", borderRadius: 12, padding: "4px 6px 4px 14px" }}>
           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} title="Enviar arquivo ou imagem" style={{ background: "transparent", border: "none", color: uploading ? "var(--accent)" : "#8B8894", fontSize: 17, cursor: "pointer", padding: "0 8px 0 0" }}>
             {uploading ? "..." : "📎"}
           </button>
           <input ref={fileInputRef} type="file" onChange={handleFile} style={{ display: "none" }} />
-          <input value={text} onChange={(e) => setText(e.target.value)} placeholder={`Conversar em #${channel.name}`} style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 14, padding: "10px 0" }} />
+          <input
+            ref={inputRef}
+            value={text}
+            onChange={handleTextChange}
+            onKeyDown={(e) => { if (e.key === "Escape") setMentionQuery(null); }}
+            placeholder={`Conversar em #${channel.name} · use @ pra marcar alguém`}
+            style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 14, padding: "10px 0" }}
+          />
           <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
         </form>
       </div>
@@ -1866,12 +2091,10 @@ function AttachmentView({ attachment }) {
    (Amigos / Adicionar amigo / Pedidos de amizade / servidores)
 --------------------------------------------------------- */
 
-function HomeSidebar({ tab, onSelectTab, pendingCount }) {
+function HomeSidebar({ tab, onSelectTab, pendingCount, dmUnreadCount }) {
   const navItems = [
-    { key: "todos", label: "Amigos", icon: "👥" },
-    { key: "mensagens", label: "Mensagens diretas", icon: "💬" },
-    { key: "adicionar", label: "Adicionar amigo", icon: "＋" },
-    { key: "pendentes", label: `Pedidos de amizade${pendingCount ? ` (${pendingCount})` : ""}`, icon: "🔗" },
+    { key: "todos", label: `Amigos${pendingCount ? ` (${pendingCount})` : ""}`, icon: "👥" },
+    { key: "mensagens", label: "Mensagens diretas", icon: "💬", badge: dmUnreadCount },
   ];
 
   return (
@@ -1882,14 +2105,14 @@ function HomeSidebar({ tab, onSelectTab, pendingCount }) {
 
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {navItems.map((item) => (
-          <HomeNavItem key={item.key} active={tab === item.key} onClick={() => onSelectTab(item.key)} icon={item.icon} label={item.label} />
+          <HomeNavItem key={item.key} active={tab === item.key} onClick={() => onSelectTab(item.key)} icon={item.icon} label={item.label} badge={item.badge} />
         ))}
       </div>
     </div>
   );
 }
 
-function HomeNavItem({ active, onClick, icon, label }) {
+function HomeNavItem({ active, onClick, icon, label, badge }) {
   const [hover, setHover] = useState(false);
   return (
     <button
@@ -1908,7 +2131,12 @@ function HomeNavItem({ active, onClick, icon, label }) {
       }}
     >
       <span style={{ fontSize: 15, width: 18, textAlign: "center", transition: "transform 160ms ease", transform: hover ? "scale(1.15)" : "scale(1)", display: "inline-block" }}>{icon}</span>
-      {label}
+      <span style={{ flex: 1 }}>{label}</span>
+      {!!badge && (
+        <span style={{ background: active ? "#0a0a0d" : "#FF5470", color: active ? "#F0EEF5" : "#fff", fontSize: 10.5, fontWeight: 800, borderRadius: 10, padding: "1px 6px", minWidth: 16, textAlign: "center" }}>
+          {badge}
+        </span>
+      )}
     </button>
   );
 }
@@ -1917,66 +2145,170 @@ function HomeNavItem({ active, onClick, icon, label }) {
    Amigos — conteúdo principal (varia com a aba escolhida na sidebar)
 --------------------------------------------------------- */
 
-function FriendsMain({ tab, friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage }) {
+function FriendsMain({ friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage }) {
+  const [innerTab, setInnerTab] = useState("disponivel");
+  const [search, setSearch] = useState("");
+  const [showAdd, setShowAdd] = useState(false);
   const [addValue, setAddValue] = useState("");
   const [inputFocused, setInputFocused] = useState(false);
   const incoming = pending.filter((p) => p.isReceiver);
   const outgoing = pending.filter((p) => !p.isReceiver);
 
+  const q = search.trim().toLowerCase();
+  const filteredFriends = friends.filter((f) => !q || f.display_name.toLowerCase().includes(q) || f.username.toLowerCase().includes(q));
+  const onlineOnly = filteredFriends.filter((f) => f.liveStatus && f.liveStatus !== "offline" && f.liveStatus !== "invisivel");
+
   return (
-    <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "20px 24px 0", borderBottom: "1px solid #1e1e24", paddingBottom: 16 }}>
-        <div style={{ fontWeight: 800, fontSize: 18, letterSpacing: -0.3 }}>
-          {tab === "todos" && "Amigos"}
-          {tab === "adicionar" && "Adicionar amigo"}
-          {tab === "pendentes" && "Pedidos de amizade"}
+    <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
+      <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <div style={{ padding: "16px 24px 0", borderBottom: "1px solid #1e1e24", paddingBottom: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+            <div style={{ fontWeight: 800, fontSize: 16, display: "flex", alignItems: "center", gap: 6 }}>👥 Amigos</div>
+            <div style={{ width: 1, height: 18, background: "#26242c" }} />
+            {[["disponivel", "Disponível"], ["todos", "Todos"], ["pendentes", `Pendentes${incoming.length ? ` (${incoming.length})` : ""}`]].map(([k, l]) => (
+              <TabPill key={k} active={innerTab === k} onClick={() => setInnerTab(k)}>{l}</TabPill>
+            ))}
+            <div style={{ flex: 1 }} />
+            <button
+              onClick={() => setShowAdd((v) => !v)}
+              style={{
+                background: showAdd ? "#1c1c22" : "var(--accent)", color: showAdd ? "#F0EEF5" : "#0a0a0d",
+                border: "none", borderRadius: 8, padding: "7px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 10,
+              }}
+            >
+              {showAdd ? "Cancelar" : "＋ Adicionar amigo"}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ padding: "16px 24px" }}>
+          {showAdd && (
+            <form
+              onSubmit={(e) => { e.preventDefault(); if (addValue.trim()) { onAdd(addValue.trim()); setAddValue(""); setShowAdd(false); } }}
+              style={{ display: "flex", gap: 8, marginBottom: 20, maxWidth: 460, background: "#141418", border: "1px solid #26242c", borderRadius: 12, padding: 14 }}
+            >
+              <input
+                value={addValue}
+                onChange={(e) => setAddValue(e.target.value)}
+                onFocus={() => setInputFocused(true)}
+                onBlur={() => setInputFocused(false)}
+                placeholder="Adicionar amigo pelo username..."
+                style={{
+                  ...inputStyle, flex: 1,
+                  borderColor: inputFocused ? "var(--accent)" : "#2a2a32",
+                  boxShadow: inputFocused ? "0 0 0 3px var(--accent-soft)" : "none",
+                  transition: "border-color 160ms ease, box-shadow 160ms ease",
+                }}
+                autoFocus
+              />
+              <button type="submit" style={{ ...primaryBtn, width: 140, marginTop: 0 }}>Enviar pedido</button>
+            </form>
+          )}
+
+          {(innerTab === "disponivel" || innerTab === "todos") && (
+            <SearchInput value={search} onChange={setSearch} placeholder="Buscar" />
+          )}
+
+          <div style={{ marginTop: 14 }}>
+            {innerTab === "disponivel" && (
+              onlineOnly.length === 0
+                ? <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Ninguém online agora.</div>
+                : (
+                  <>
+                    <ChannelGroupLabel>Online — {onlineOnly.length}</ChannelGroupLabel>
+                    {onlineOnly.map((f) => <FriendRow key={f.id} f={f} onViewProfile={onViewProfile} onMessage={onMessage} />)}
+                  </>
+                )
+            )}
+            {innerTab === "todos" && (
+              <FriendsGroupedList friends={filteredFriends} onViewProfile={onViewProfile} onMessage={onMessage} />
+            )}
+            {innerTab === "pendentes" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                {incoming.length === 0 && outgoing.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum pedido pendente.</div>}
+                {incoming.map((p) => <PendingRow key={p.id} p={p} onRespond={onRespond} />)}
+                {outgoing.map((p) => (
+                  <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", opacity: 0.6 }}>
+                    <Avatar color={p.other.avatar_color} name={p.other.display_name} size={38} />
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 700 }}>{p.other.display_name}</div>
+                      <div style={{ fontSize: 12, color: "#8B8894" }}>pedido enviado, aguardando</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      <div style={{ padding: "16px 24px" }}>
-        {tab === "adicionar" && (
-          <form
-            onSubmit={(e) => { e.preventDefault(); if (addValue.trim()) { onAdd(addValue.trim()); setAddValue(""); } }}
-            style={{ display: "flex", gap: 8, marginBottom: 20, maxWidth: 460 }}
-          >
-            <input
-              value={addValue}
-              onChange={(e) => setAddValue(e.target.value)}
-              onFocus={() => setInputFocused(true)}
-              onBlur={() => setInputFocused(false)}
-              placeholder="Adicionar amigo pelo username..."
-              style={{
-                ...inputStyle, flex: 1,
-                borderColor: inputFocused ? "var(--accent)" : "#2a2a32",
-                boxShadow: inputFocused ? "0 0 0 3px var(--accent-soft)" : "none",
-                transition: "border-color 160ms ease, box-shadow 160ms ease",
-              }}
-              autoFocus
-            />
-            <button type="submit" style={{ ...primaryBtn, width: 140, marginTop: 0 }}>Enviar pedido</button>
-          </form>
-        )}
+      <ActiveNowPanel friends={friends} onViewProfile={onViewProfile} />
+    </div>
+  );
+}
 
-        {tab === "todos" && (
-          <FriendsGroupedList friends={friends} onViewProfile={onViewProfile} onMessage={onMessage} />
-        )}
+function TabPill({ active, onClick, children }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        background: "transparent", border: "none", cursor: "pointer",
+        color: active ? "#F0EEF5" : hover ? "#DFDCE6" : "#8B8894",
+        fontSize: 14, fontWeight: 600, padding: "0 0 12px",
+        borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent",
+        transition: "color 140ms ease, border-color 140ms ease",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
 
-        {tab === "pendentes" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            {incoming.length === 0 && outgoing.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "10px 0" }}>Nenhum pedido pendente.</div>}
-            {incoming.map((p) => <PendingRow key={p.id} p={p} onRespond={onRespond} />)}
-            {outgoing.map((p) => (
-              <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", opacity: 0.6 }}>
-                <Avatar color={p.other.avatar_color} name={p.other.display_name} size={38} />
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700 }}>{p.other.display_name}</div>
-                  <div style={{ fontSize: 12, color: "#8B8894" }}>pedido enviado, aguardando</div>
-                </div>
+function SearchInput({ value, onChange, placeholder }) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <input
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      placeholder={placeholder}
+      style={{
+        ...inputStyle, maxWidth: 460,
+        borderColor: focused ? "var(--accent)" : "#2a2a32",
+        boxShadow: focused ? "0 0 0 3px var(--accent-soft)" : "none",
+        transition: "border-color 160ms ease, box-shadow 160ms ease",
+      }}
+    />
+  );
+}
+
+function ActiveNowPanel({ friends, onViewProfile }) {
+  const active = friends.filter((f) => f.liveStatus && f.liveStatus !== "offline" && f.liveStatus !== "invisivel");
+  return (
+    <div style={{ width: 260, flexShrink: 0, background: "#111114", borderLeft: "1px solid #1e1e24", padding: 20, overflowY: "auto" }}>
+      <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 16 }}>Ativo agora</div>
+      {active.length === 0 ? (
+        <div style={{ background: "#17171c", borderRadius: 12, padding: "18px 14px", textAlign: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>Por enquanto, está quieto...</div>
+          <div style={{ fontSize: 11.5, color: "#8B8894", lineHeight: 1.5 }}>Quando um amigo aparecer online ou entrar numa call, você vê por aqui.</div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {active.map((f) => (
+            <div key={f.id} onClick={() => onViewProfile?.(f.id)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px", borderRadius: 10, cursor: "pointer" }}>
+              <Avatar color={f.avatar_color} name={f.display_name} status={f.liveStatus} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={34} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.display_name}</div>
+                <div style={{ fontSize: 11, color: "#8B8894", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.custom_status || STATUS_META[f.liveStatus]?.label}</div>
               </div>
-            ))}
-          </div>
-        )}
-      </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2490,7 +2822,7 @@ function MenuItem({ children, onClick, danger }) {
    Mensagens diretas
 --------------------------------------------------------- */
 
-function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onViewProfile }) {
+function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onViewProfile, unreadDms }) {
   const friend = friends.find((f) => f.id === dmFriendId);
 
   if (friend) {
@@ -2506,9 +2838,10 @@ function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onVie
           <div key={f.id} onClick={() => setDmFriendId(f.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 10, cursor: "pointer" }}>
             <Avatar color={f.avatar_color} name={f.display_name} frame={f.avatar_frame} avatarUrl={f.avatar_url} customFrameUrl={f.custom_frame_url} size={38} />
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 14, fontWeight: 700 }}>{f.display_name}</div>
+              <div style={{ fontSize: 14, fontWeight: unreadDms?.[f.id] ? 800 : 700 }}>{f.display_name}</div>
               <div style={{ fontSize: 12, color: "#8B8894" }}>@{f.username}</div>
             </div>
+            {unreadDms?.[f.id] && <span style={{ width: 9, height: 9, borderRadius: "50%", background: "#FF5470", flexShrink: 0 }} />}
           </div>
         ))}
       </div>
@@ -2520,7 +2853,9 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [showPanel, setShowPanel] = useState(true);
+  const [uploading, setUploading] = useState(false);
   const scrollRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     let active = true;
@@ -2555,6 +2890,26 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
     const { data, error } = await supabase.from("direct_messages").insert({ sender_id: profile.id, receiver_id: friend.id, content }).select().single();
     if (error) { alert(error.message); return; }
     setMessages((m) => [...m, data]);
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 15 * 1024 * 1024) { alert("Arquivo até 15MB por enquanto."); e.target.value = ""; return; }
+    setUploading(true);
+    const path = `dm/${[profile.id, friend.id].sort().join("-")}/${Date.now()}-${file.name.replace(/[^\w.\-]/g, "_")}`;
+    const { error: upErr } = await supabase.storage.from("attachments").upload(path, file);
+    if (upErr) { setUploading(false); alert("Não deu pra enviar: " + upErr.message); e.target.value = ""; return; }
+    const { data: pub } = supabase.storage.from("attachments").getPublicUrl(path);
+    const { data, error } = await supabase.from("direct_messages").insert({
+      sender_id: profile.id, receiver_id: friend.id, content: text.trim(),
+      file_url: pub.publicUrl, file_name: file.name, file_size: file.size, mime_type: file.type,
+    }).select().single();
+    setUploading(false);
+    if (error) { alert(error.message); e.target.value = ""; return; }
+    setMessages((m) => [...m, data]);
+    setText("");
+    e.target.value = "";
   }
 
   return (
@@ -2593,7 +2948,8 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
                       <span style={{ fontSize: 11, color: "#5A5866" }}>{timeFmt(m.created_at)}</span>
                     </div>
                   )}
-                  <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>
+                  {m.content && <div style={{ fontSize: 14, color: "#DFDCE6", lineHeight: 1.5, wordBreak: "break-word" }}>{m.content}</div>}
+                  {m.file_url && <AttachmentView attachment={m} />}
                 </div>
               </div>
             );
@@ -2602,6 +2958,10 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
 
       <div style={{ padding: "0 20px 18px" }}>
         <form onSubmit={send} style={{ display: "flex", alignItems: "center", background: "#17171c", border: "1px solid #26242c", borderRadius: 12, padding: "4px 6px 4px 14px" }}>
+          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploading} title="Enviar arquivo ou imagem" style={{ background: "transparent", border: "none", color: uploading ? "var(--accent)" : "#8B8894", fontSize: 17, cursor: "pointer", padding: "0 8px 0 0" }}>
+            {uploading ? "..." : "📎"}
+          </button>
+          <input ref={fileInputRef} type="file" onChange={handleFile} style={{ display: "none" }} />
           <input value={text} onChange={(e) => setText(e.target.value)} placeholder={`Conversar com ${friend.display_name}`} style={{ flex: 1, background: "transparent", border: "none", outline: "none", color: "#F0EEF5", fontSize: 14, padding: "10px 0" }} />
           <button type="submit" style={{ background: "var(--accent)", color: "#0a0a0d", border: "none", borderRadius: 8, width: 32, height: 32, marginLeft: 4, cursor: "pointer", fontWeight: 800 }}>➤</button>
         </form>
