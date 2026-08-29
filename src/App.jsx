@@ -412,6 +412,19 @@ function useVoiceCall(profile) {
         ...p,
         [peerId]: { ...(p[peerId] || {}), ...(isScreenStream ? { screenStream: stream } : { audioStream: stream }) },
       }));
+      // Quando a pessoa PARA de compartilhar, o track de vídeo dela "termina"
+      // — sem isso, quem assiste fica preso olhando o último frame (preto).
+      if (isScreenStream) {
+        e.track.onended = () => {
+          setParticipants((p) => {
+            const cur = p[peerId];
+            if (!cur || cur.screenStream !== stream) return p;
+            const next = { ...p };
+            next[peerId] = { ...cur, screenStream: undefined };
+            return next;
+          });
+        };
+      }
     };
     pc.onnegotiationneeded = async () => {
       try {
@@ -457,13 +470,14 @@ function useVoiceCall(profile) {
   }
 
   function startSpeakingLoop() {
+    const THRESHOLD = 3; // sensível o suficiente pra fala normal, não só grito
     function tick() {
       const nextSpeaking = new Set();
       const localA = getAnalyser("you", localStreamRef.current);
       if (localA && !localStreamRef.current?.getAudioTracks().every((t) => !t.enabled)) {
         localA.analyser.getByteTimeDomainData(localA.data);
         const level = rmsLevel(localA.data);
-        if (level > 10) nextSpeaking.add("you");
+        if (level > THRESHOLD) nextSpeaking.add("you");
       }
       Object.entries(participants).forEach(([id, p]) => {
         if (!p.audioStream) return;
@@ -471,7 +485,7 @@ function useVoiceCall(profile) {
         if (!a) return;
         a.analyser.getByteTimeDomainData(a.data);
         const level = rmsLevel(a.data);
-        if (level > 10) nextSpeaking.add(id);
+        if (level > THRESHOLD) nextSpeaking.add(id);
       });
       setLocalSpeaking(nextSpeaking.has("you"));
       setSpeakingIds((prev) => {
@@ -645,6 +659,7 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   const [currentServerId, setCurrentServerId] = useState(null);
   const [currentChannelId, setCurrentChannelId] = useState(null);
   const [channels, setChannels] = useState([]);
+  const [categories, setCategories] = useState([]);
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showJoinServer, setShowJoinServer] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
@@ -741,12 +756,40 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
     setChannels(data || []);
     const firstText = data?.find((c) => c.type === "text");
     setCurrentChannelId(firstText?.id ?? null);
+    const { data: cats } = await supabase.from("channel_categories").select("*").eq("server_id", serverId).order("position");
+    setCategories(cats || []);
   }
 
-  async function createChannel(name, type) {
+  async function createChannel(name, type, categoryId) {
     if (!currentServer) return;
-    const { error } = await supabase.from("channels").insert({ server_id: currentServer.id, name, type, position: channels.length });
+    const { error } = await supabase.from("channels").insert({ server_id: currentServer.id, name, type, position: channels.length, category_id: categoryId || null });
     if (error) { alert("Não deu pra criar o canal: " + error.message); return; }
+    await loadChannels(currentServer.id);
+  }
+
+  async function createCategory(name) {
+    if (!currentServer) return;
+    const { error } = await supabase.from("channel_categories").insert({ server_id: currentServer.id, name, position: categories.length });
+    if (error) { alert("Não deu pra criar a categoria: " + error.message); return; }
+    await loadChannels(currentServer.id);
+  }
+
+  async function deleteCategory(categoryId) {
+    const { error } = await supabase.from("channel_categories").delete().eq("id", categoryId);
+    if (error) { alert(error.message); return; }
+    await loadChannels(currentServer.id);
+  }
+
+  async function editChannel(channelId, patch) {
+    const { error } = await supabase.from("channels").update(patch).eq("id", channelId);
+    if (error) { alert("Não deu pra salvar: " + error.message); return; }
+    await loadChannels(currentServer.id);
+  }
+
+  async function deleteChannel(channelId) {
+    const { error } = await supabase.from("channels").delete().eq("id", channelId);
+    if (error) { alert("Não deu pra apagar: " + error.message); return; }
+    if (currentChannelId === channelId) setCurrentChannelId(null);
     await loadChannels(currentServer.id);
   }
 
@@ -768,6 +811,10 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
       const { data: pres } = await supabase.from("user_presence").select("*").in("user_id", ids);
       const presMap = Object.fromEntries((pres || []).map((p) => [p.user_id, p]));
       accepted.forEach((f) => { f.liveStatus = presMap[f.id]?.status ?? "offline"; });
+      const { data: tagRows } = await supabase.from("server_members").select("user_id, show_tag, servers(tag_label)").in("user_id", ids).eq("show_tag", true);
+      const tagMap = {};
+      (tagRows || []).forEach((r) => { if (r.servers?.tag_label && !tagMap[r.user_id]) tagMap[r.user_id] = r.servers.tag_label; });
+      accepted.forEach((f) => { f.featured_tag = tagMap[f.id] || null; });
     }
     setFriends(accepted);
     setPending(pend);
@@ -858,11 +905,16 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
               <ChannelSidebar
                 server={currentServer}
                 channels={channels}
+                categories={categories}
                 currentChannelId={currentChannelId}
                 onSelectChannel={(id) => { setCurrentChannelId(id); setUnreadChannels((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
                 call={call}
                 onOpenSettings={() => setShowServerSettings(true)}
                 onCreateChannel={createChannel}
+                onCreateCategory={createCategory}
+                onDeleteCategory={deleteCategory}
+                onEditChannel={editChannel}
+                onDeleteChannel={deleteChannel}
                 unreadChannels={unreadChannels}
               />
             )}
@@ -1324,11 +1376,37 @@ function RailIcon({ active, onClick, children, label }) {
    Sidebar de canais
 --------------------------------------------------------- */
 
-function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel, unreadChannels }) {
+function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel, onCreateCategory, onDeleteCategory, onEditChannel, onDeleteChannel, categories, unreadChannels }) {
   const [creatingType, setCreatingType] = useState(null);
+  const [creatingCategory, setCreatingCategory] = useState(false);
+  const [editingChannel, setEditingChannel] = useState(null);
   if (!server) return <div style={{ width: 240, background: "#111114" }} />;
-  const textChannels = channels.filter((c) => c.type === "text");
-  const voiceChannels = channels.filter((c) => c.type === "voice");
+
+  const grouped = [...categories].sort((a, b) => a.position - b.position).map((cat) => ({
+    category: cat,
+    channels: channels.filter((c) => c.category_id === cat.id),
+  }));
+  const uncategorized = channels.filter((c) => !c.category_id);
+
+  function renderChannel(c) {
+    return (
+      <div key={c.id}>
+        <ChannelRow
+          active={c.id === currentChannelId}
+          onClick={() => onSelectChannel(c.id)}
+          icon={c.type === "voice" ? "🔊" : "#"}
+          label={c.name}
+          unread={unreadChannels?.[c.id]}
+          onEdit={() => setEditingChannel(c)}
+        />
+        {c.type === "voice" && call.joinedChannelId === c.id && (
+          <div style={{ marginLeft: 22, marginBottom: 6 }}>
+            <div style={{ fontSize: 10.5, color: "#3DDC84" }}>● você{Object.values(call.participants).map((p) => p.name).length > 0 ? `, ${Object.values(call.participants).map((p) => p.name).join(", ")}` : ""}</div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div style={{ width: 240, flexShrink: 0, background: "#111114", display: "flex", flexDirection: "column", borderRight: "1px solid #1e1e24" }}>
@@ -1347,25 +1425,21 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "12px 10px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <ChannelGroupLabel>Canais de texto</ChannelGroupLabel>
-          <button onClick={() => setCreatingType("text")} title="Criar canal de texto" style={miniAddBtn}>+</button>
+        <div style={{ display: "flex", gap: 6, marginBottom: 4 }}>
+          <button onClick={() => setCreatingType("text")} style={{ ...miniAddBtn, ...miniAddBtnPill }}># Canal</button>
+          <button onClick={() => setCreatingType("voice")} style={{ ...miniAddBtn, ...miniAddBtnPill }}>🔊 Voz</button>
+          <button onClick={() => setCreatingCategory(true)} style={{ ...miniAddBtn, ...miniAddBtnPill }}>▾ Categoria</button>
         </div>
-        {textChannels.map((c) => (
-          <ChannelRow key={c.id} active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="#" label={c.name} unread={unreadChannels?.[c.id]} />
-        ))}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18 }}>
-          <ChannelGroupLabel>Canais de voz</ChannelGroupLabel>
-          <button onClick={() => setCreatingType("voice")} title="Criar canal de voz" style={miniAddBtn}>+</button>
-        </div>
-        {voiceChannels.map((c) => (
-          <div key={c.id}>
-            <ChannelRow active={c.id === currentChannelId} onClick={() => onSelectChannel(c.id)} icon="🔊" label={c.name} />
-            {call.joinedChannelId === c.id && (
-              <div style={{ marginLeft: 22, marginBottom: 6 }}>
-                <div style={{ fontSize: 10.5, color: "#3DDC84" }}>● você{Object.values(call.participants).map((p) => p.name).length > 0 ? `, ${Object.values(call.participants).map((p) => p.name).join(", ")}` : ""}</div>
-              </div>
-            )}
+
+        {uncategorized.map(renderChannel)}
+
+        {grouped.map(({ category, channels: catChannels }) => (
+          <div key={category.id} style={{ marginTop: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <ChannelGroupLabel>{category.name}</ChannelGroupLabel>
+              <button onClick={() => { if (confirm(`Apagar a categoria "${category.name}"? Os canais dela voltam pra lista geral.`)) onDeleteCategory(category.id); }} title="Apagar categoria" style={miniAddBtn}>✕</button>
+            </div>
+            {catChannels.map(renderChannel)}
           </div>
         ))}
       </div>
@@ -1384,8 +1458,21 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
       {creatingType && (
         <CreateChannelModal
           type={creatingType}
+          categories={categories}
           onClose={() => setCreatingType(null)}
-          onCreate={async (name) => { await onCreateChannel(name, creatingType); setCreatingType(null); }}
+          onCreate={async (name, categoryId) => { await onCreateChannel(name, creatingType, categoryId); setCreatingType(null); }}
+        />
+      )}
+      {creatingCategory && (
+        <CreateCategoryModal onClose={() => setCreatingCategory(false)} onCreate={async (name) => { await onCreateCategory(name); setCreatingCategory(false); }} />
+      )}
+      {editingChannel && (
+        <EditChannelModal
+          channel={editingChannel}
+          categories={categories}
+          onClose={() => setEditingChannel(null)}
+          onSave={async (patch) => { await onEditChannel(editingChannel.id, patch); setEditingChannel(null); }}
+          onDelete={async () => { if (confirm(`Apagar o canal "${editingChannel.name}"? Isso apaga as mensagens dele também.`)) { await onDeleteChannel(editingChannel.id); setEditingChannel(null); } }}
         />
       )}
     </div>
@@ -1393,18 +1480,75 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
 }
 
 const miniAddBtn = { background: "transparent", border: "none", color: "#5A5866", fontSize: 15, cursor: "pointer", padding: "0 6px", lineHeight: 1 };
+const miniAddBtnPill = { background: "#17171c", border: "1px solid #26242c", borderRadius: 7, fontSize: 11, color: "#8B8894", padding: "5px 8px", flex: 1, fontWeight: 600 };
 
-function CreateChannelModal({ type, onClose, onCreate }) {
+function CreateCategoryModal({ onClose, onCreate }) {
   const [name, setName] = useState("");
   return (
     <ModalShell onClose={onClose}>
       <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onCreate(name.trim()); }} style={{ padding: 26, width: 340 }}>
+        <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 16 }}>Nova categoria</div>
+        <Field label="Nome da categoria">
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value.toUpperCase())} placeholder="COMUNIDADE" style={inputStyle} />
+        </Field>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button type="button" onClick={onClose} style={{ ...secondaryBtn, flex: 1 }}>Cancelar</button>
+          <button type="submit" style={{ ...primaryBtn, flex: 1, marginTop: 0 }}>Criar</button>
+        </div>
+      </form>
+    </ModalShell>
+  );
+}
+
+function EditChannelModal({ channel, categories, onClose, onSave, onDelete }) {
+  const [name, setName] = useState(channel.name);
+  const [categoryId, setCategoryId] = useState(channel.category_id || "");
+  return (
+    <ModalShell onClose={onClose}>
+      <div style={{ padding: 26, width: 340 }}>
+        <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 4 }}>
+          Editar canal {channel.type === "voice" ? "de voz" : "de texto"}
+        </div>
+        <div style={{ fontSize: 12.5, color: "#8B8894", marginBottom: 16 }}>{channel.type === "voice" ? "🔊" : "#"} {channel.name}</div>
+        <Field label="Nome do canal">
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} />
+        </Field>
+        <Field label="Categoria">
+          <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+            <option value="">Sem categoria</option>
+            {categories.map((cat) => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
+          </select>
+        </Field>
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          <button type="button" onClick={onClose} style={{ ...secondaryBtn, flex: 1 }}>Cancelar</button>
+          <button type="button" onClick={() => onSave({ name: name.trim() || channel.name, category_id: categoryId || null })} style={{ ...primaryBtn, flex: 1, marginTop: 0 }}>Salvar</button>
+        </div>
+        <button type="button" onClick={onDelete} style={{ ...secondaryBtn, width: "100%", marginTop: 10, color: "#FF5470", borderColor: "#3a1c22" }}>Apagar canal</button>
+      </div>
+    </ModalShell>
+  );
+}
+
+function CreateChannelModal({ type, categories, onClose, onCreate }) {
+  const [name, setName] = useState("");
+  const [categoryId, setCategoryId] = useState("");
+  return (
+    <ModalShell onClose={onClose}>
+      <form onSubmit={(e) => { e.preventDefault(); if (name.trim()) onCreate(name.trim(), categoryId || null); }} style={{ padding: 26, width: 340 }}>
         <div style={{ fontWeight: 800, fontSize: 17, marginBottom: 16 }}>
           Novo canal de {type === "voice" ? "voz" : "texto"}
         </div>
         <Field label="Nome do canal">
           <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder={type === "voice" ? "Sala de jogos" : "geral"} style={inputStyle} />
         </Field>
+        {categories.length > 0 && (
+          <Field label="Categoria (opcional)">
+            <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>
+              <option value="">Sem categoria</option>
+              {categories.map((cat) => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
+            </select>
+          </Field>
+        )}
         <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
           <button type="button" onClick={onClose} style={{ ...secondaryBtn, flex: 1 }}>Cancelar</button>
           <button type="submit" style={{ ...primaryBtn, flex: 1, marginTop: 0 }}>Criar</button>
@@ -1816,7 +1960,7 @@ function ChannelGroupLabel({ children, style }) {
   return <div style={{ fontSize: 11, fontWeight: 700, color: "#5A5866", textTransform: "uppercase", letterSpacing: 0.6, padding: "4px 8px", ...style }}>{children}</div>;
 }
 
-function ChannelRow({ active, onClick, icon, label, unread }) {
+function ChannelRow({ active, onClick, icon, label, unread, onEdit }) {
   const [hover, setHover] = useState(false);
   return (
     <div
@@ -1833,9 +1977,12 @@ function ChannelRow({ active, onClick, icon, label, unread }) {
       }}
     >
       <span style={{ opacity: active ? 1 : 0.7, fontSize: 12, width: 14, textAlign: "center", transform: hover ? "scale(1.15)" : "scale(1)", transition: "transform 140ms ease", display: "inline-block" }}>{icon}</span>
-      <span style={{ flex: 1 }}>{label}</span>
-      {unread && (
+      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+      {unread && !hover && (
         <span style={{ width: 8, height: 8, borderRadius: "50%", background: unread === "mention" ? "#FF9D4D" : "#FF5470", flexShrink: 0 }} />
+      )}
+      {hover && onEdit && (
+        <span onClick={(e) => { e.stopPropagation(); onEdit(); }} title="Editar canal" style={{ fontSize: 12, color: "#8B8894", flexShrink: 0, padding: 2 }}>⚙</span>
       )}
     </div>
   );
@@ -2682,7 +2829,14 @@ function ProfileCardBody({ data, width = 340 }) {
         <div style={{ padding: "0 20px 20px", marginTop: -32 }}>
           <Avatar color={data.avatar_color} name={data.display_name} status={data.status} frame={data.avatar_frame} avatarUrl={data.avatar_url} customFrameUrl={data.custom_frame_url} size={64} />
           <div style={{ marginTop: 8 }}>
-            <div style={{ fontSize: 17, fontWeight: 800 }}>{data.display_name}</div>
+            <div style={{ fontSize: 17, fontWeight: 800, display: "flex", alignItems: "center", gap: 6 }}>
+              {data.display_name}
+              {data.featured_tag && (
+                <span style={{ fontSize: 10.5, fontWeight: 800, color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 5, padding: "2px 6px", flexShrink: 0 }}>
+                  {data.featured_tag}
+                </span>
+              )}
+            </div>
             <div style={{ fontSize: 12.5, color: "#8B8894" }}>@{data.username}</div>
           </div>
           {data.custom_status && (
@@ -2708,6 +2862,16 @@ function ProfileCardBody({ data, width = 340 }) {
   );
 }
 
+async function fetchFeaturedTag(userId) {
+  const { data } = await supabase
+    .from("server_members")
+    .select("show_tag, servers(tag_label)")
+    .eq("user_id", userId)
+    .eq("show_tag", true);
+  const withTag = (data || []).find((r) => r.servers?.tag_label);
+  return withTag?.servers?.tag_label || null;
+}
+
 function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend, onMessage, servers, profile }) {
   const [data, setData] = useState(null);
   const [sending, setSending] = useState(false);
@@ -2718,8 +2882,10 @@ function UserProfileModal({ userId, onClose, isFriend, isPending, onAddFriend, o
 
   useEffect(() => {
     let active = true;
-    supabase.from("profiles").select("*").eq("id", userId).single().then(({ data, error }) => {
-      if (active && !error) setData(data);
+    supabase.from("profiles").select("*").eq("id", userId).single().then(async ({ data, error }) => {
+      if (!active || error) return;
+      const featured_tag = await fetchFeaturedTag(userId);
+      if (active) setData({ ...data, featured_tag });
     });
     supabase.from("blocked_users").select("blocked_id").eq("blocker_id", profile.id).eq("blocked_id", userId).maybeSingle()
       .then(({ data }) => { if (active) setBlocked(!!data); });
