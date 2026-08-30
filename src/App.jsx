@@ -158,6 +158,18 @@ function TiltGlow({ children, style, tilt = 6, glow = true, scale = 1.012, disab
   );
 }
 
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth <= 800);
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 800px)");
+    const handler = () => setIsMobile(mq.matches);
+    handler();
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  return isMobile;
+}
+
 export default function GranolaApp() {
   const [session, setSession] = useState(undefined); // undefined = carregando
   const [profile, setProfile] = useState(null);
@@ -211,6 +223,15 @@ export default function GranolaApp() {
         input:focus, textarea:focus { transition: border-color 160ms ease, box-shadow 160ms ease; }
         @media (prefers-reduced-motion: reduce) {
           button:not(:disabled):hover, button:not(:disabled):active { transform: none !important; }
+        }
+        .granolaModalWrap { max-width: 94vw; max-height: 90vh; overflow-y: auto; }
+        .granolaModalWrap > * { max-width: 100%; }
+        @media (max-width: 800px) {
+          .granolaModalWrap { width: 94vw !important; }
+          input, textarea, select { font-size: 16px !important; } /* evita zoom automático no iOS */
+        }
+        @media (hover: none) {
+          button:not(:disabled):hover { filter: none; }
         }
       `}</style>
       {!session || !profile ? (
@@ -861,6 +882,8 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
   }
 
   const [userVolumes, setUserVolumes] = useState({});
+  const isMobile = useIsMobile();
+  const [mobilePane, setMobilePane] = useState("servers"); // 'servers' | 'list' | 'content'
 
   return (
     <div style={{ display: "flex", width: "100%", height: "100%" }}>
@@ -882,84 +905,107 @@ function MainApp({ profile, setProfile, accent, onLogout }) {
         ) : null
       ))}
 
-      {!fullscreenCall && (
-        <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      {(!isMobile || mobilePane !== "content") && !fullscreenCall && (
+        <div style={{ display: "flex", flexDirection: "column", height: "100%", width: isMobile ? "100%" : undefined }}>
           <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
-            <ServerRail
-              servers={servers}
-              currentServerId={view === "server" ? currentServerId : null}
-              onHome={() => setView("home")}
-              onSelect={selectServer}
-              onCreate={() => setShowCreateServer(true)}
-              onJoin={() => setShowJoinServer(true)}
-              homeActive={view === "home"}
-            />
-            {view === "home" ? (
-              <HomeSidebar
-                tab={homeTab}
-                onSelectTab={setHomeTab}
-                pendingCount={pending.filter((p) => p.isReceiver).length}
-                dmUnreadCount={Object.keys(unreadDms).length}
-              />
-            ) : (
-              <ChannelSidebar
-                server={currentServer}
-                channels={channels}
-                categories={categories}
-                currentChannelId={currentChannelId}
-                onSelectChannel={(id) => { setCurrentChannelId(id); setUnreadChannels((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
-                call={call}
-                onOpenSettings={() => setShowServerSettings(true)}
-                onCreateChannel={createChannel}
-                onCreateCategory={createCategory}
-                onDeleteCategory={deleteCategory}
-                onEditChannel={editChannel}
-                onDeleteChannel={deleteChannel}
-                unreadChannels={unreadChannels}
+            {(!isMobile || mobilePane === "servers") && (
+              <ServerRail
+                servers={servers}
+                currentServerId={view === "server" ? currentServerId : null}
+                onHome={() => { setView("home"); if (isMobile) setMobilePane("list"); }}
+                onSelect={(id) => { selectServer(id); if (isMobile) setMobilePane("list"); }}
+                onCreate={() => setShowCreateServer(true)}
+                onJoin={() => setShowJoinServer(true)}
+                homeActive={view === "home"}
+                mobileExpanded={isMobile && mobilePane === "servers"}
               />
             )}
+            {(!isMobile || mobilePane === "list") && (
+              view === "home" ? (
+                <HomeSidebar
+                  tab={homeTab}
+                  onSelectTab={(t) => { setHomeTab(t); if (isMobile) setMobilePane("content"); }}
+                  pendingCount={pending.filter((p) => p.isReceiver).length}
+                  dmUnreadCount={Object.keys(unreadDms).length}
+                  onBack={isMobile ? () => setMobilePane("servers") : null}
+                />
+              ) : (
+                <ChannelSidebar
+                  server={currentServer}
+                  channels={channels}
+                  categories={categories}
+                  currentChannelId={currentChannelId}
+                  onSelectChannel={(id) => { setCurrentChannelId(id); setUnreadChannels((prev) => { const n = { ...prev }; delete n[id]; return n; }); if (isMobile) setMobilePane("content"); }}
+                  call={call}
+                  onOpenSettings={() => setShowServerSettings(true)}
+                  onCreateChannel={createChannel}
+                  onCreateCategory={createCategory}
+                  onDeleteCategory={deleteCategory}
+                  onEditChannel={editChannel}
+                  onDeleteChannel={deleteChannel}
+                  unreadChannels={unreadChannels}
+                  onBack={isMobile ? () => setMobilePane("servers") : null}
+                />
+              )
+            )}
           </div>
-          {call.joinedChannelId && (
+          {(!isMobile || mobilePane === "list") && call.joinedChannelId && (
             <VoiceConnectedBar
               call={call}
               channelName={channels.find((c) => c.id === call.joinedChannelId)?.name}
               serverName={currentServer?.name}
-              onExpand={() => { setView("server"); setFullscreenCall(false); }}
+              onExpand={() => { setView("server"); setFullscreenCall(false); if (isMobile) setMobilePane("content"); }}
             />
           )}
-          <ProfileFooter profile={profile} onOpenProfile={() => setShowProfile(true)} call={call} />
+          {(!isMobile || mobilePane === "list") && <ProfileFooter profile={profile} onOpenProfile={() => setShowProfile(true)} call={call} />}
         </div>
       )}
 
-      {view === "server" && currentChannel?.type === "voice" && call.joinedChannelId === currentChannel.id ? (
-        <VoiceStage
-          channel={currentChannel}
-          call={call}
-          profile={profile}
-          fullscreen={fullscreenCall}
-          onToggleFullscreen={() => setFullscreenCall((f) => !f)}
-          userVolumes={userVolumes}
-          onSetUserVolume={(id, v) => setUserVolumes((prev) => ({ ...prev, [id]: v }))}
-          onViewProfile={setViewingUserId}
-        />
-      ) : view === "home" ? (
-        homeTab === "mensagens" ? (
-          <DirectMessagesView
-            friends={friends}
+      {(!isMobile || mobilePane === "content") && (
+        view === "server" && currentChannel?.type === "voice" && call.joinedChannelId === currentChannel.id ? (
+          <VoiceStage
+            channel={currentChannel}
+            call={call}
             profile={profile}
-            dmFriendId={dmFriendId}
-            setDmFriendId={(id) => { setDmFriendId(id); if (id) setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
+            fullscreen={fullscreenCall}
+            onToggleFullscreen={() => setFullscreenCall((f) => !f)}
+            userVolumes={userVolumes}
+            onSetUserVolume={(id, v) => setUserVolumes((prev) => ({ ...prev, [id]: v }))}
             onViewProfile={setViewingUserId}
-            unreadDms={unreadDms}
+            onBack={isMobile ? () => setMobilePane("list") : null}
+            isMobile={isMobile}
           />
+        ) : view === "home" ? (
+          homeTab === "mensagens" ? (
+            <DirectMessagesView
+              friends={friends}
+              profile={profile}
+              dmFriendId={dmFriendId}
+              setDmFriendId={(id) => { setDmFriendId(id); if (id) setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
+              onViewProfile={setViewingUserId}
+              unreadDms={unreadDms}
+              isMobile={isMobile}
+              onBack={isMobile ? () => setMobilePane("list") : null}
+            />
+          ) : (
+            <FriendsMain
+              friends={friends}
+              pending={pending}
+              onAdd={sendFriendRequest}
+              onRespond={respondRequest}
+              profile={profile}
+              onViewProfile={setViewingUserId}
+              onMessage={(id) => { setHomeTab("mensagens"); setDmFriendId(id); setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }}
+              isMobile={isMobile}
+              onBack={isMobile ? () => setMobilePane("list") : null}
+            />
+          )
         ) : (
-          <FriendsMain friends={friends} pending={pending} onAdd={sendFriendRequest} onRespond={respondRequest} profile={profile} onViewProfile={setViewingUserId} onMessage={(id) => { setHomeTab("mensagens"); setDmFriendId(id); setUnreadDms((prev) => { const n = { ...prev }; delete n[id]; return n; }); }} />
+          <>
+            <ChatArea channel={currentChannel} profile={profile} onViewProfile={setViewingUserId} onBack={isMobile ? () => setMobilePane("list") : null} />
+            {!fullscreenCall && !isMobile && currentServer && <MembersPanel server={currentServer} profile={profile} onViewProfile={setViewingUserId} />}
+          </>
         )
-      ) : (
-        <>
-          <ChatArea channel={currentChannel} profile={profile} onViewProfile={setViewingUserId} />
-          {!fullscreenCall && currentServer && <MembersPanel server={currentServer} profile={profile} onViewProfile={setViewingUserId} />}
-        </>
       )}
 
       {showCreateServer && <CreateServerModal onClose={() => setShowCreateServer(false)} onCreate={createServer} />}
@@ -1086,7 +1132,7 @@ function VoicePillBtn({ active, onClick, title, children }) {
   );
 }
 
-function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, userVolumes, onSetUserVolume, onViewProfile }) {
+function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, userVolumes, onSetUserVolume, onViewProfile, onBack, isMobile }) {
   const [pinnedId, setPinnedId] = useState(null);
   const [showChat, setShowChat] = useState(false);
 
@@ -1128,7 +1174,10 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, us
   return (
     <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "16px 24px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ fontWeight: 700, fontSize: 15 }}>🔊 {channel.name}</div>
+        <div style={{ fontWeight: 700, fontSize: 15, display: "flex", alignItems: "center", gap: 8 }}>
+          {onBack && <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 15, cursor: "pointer" }}>←</button>}
+          🔊 {channel.name}
+        </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button onClick={() => setShowChat((v) => !v)} style={{ ...secondaryBtn, width: "auto", padding: "7px 14px", background: showChat ? "var(--accent-soft)" : "#1c1c22", color: showChat ? "var(--accent)" : "#F0EEF5", border: showChat ? "1px solid var(--accent)" : "1px solid #2a2a32" }}>
             💬 Chat
@@ -1162,7 +1211,17 @@ function VoiceStage({ channel, call, profile, fullscreen, onToggleFullscreen, us
             </div>
           )}
         </div>
-        {showChat && <CallChatPanel channel={channel} profile={profile} onViewProfile={onViewProfile} onClose={() => setShowChat(false)} />}
+        {showChat && (
+          isMobile ? (
+            <div onClick={() => setShowChat(false)} style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,0.65)", zIndex: 40, display: "flex", justifyContent: "flex-end" }}>
+              <div onClick={(e) => e.stopPropagation()} style={{ width: "88vw", maxWidth: 320 }}>
+                <CallChatPanel channel={channel} profile={profile} onViewProfile={onViewProfile} onClose={() => setShowChat(false)} />
+              </div>
+            </div>
+          ) : (
+            <CallChatPanel channel={channel} profile={profile} onViewProfile={onViewProfile} onClose={() => setShowChat(false)} />
+          )
+        )}
       </div>
 
       <div style={{ padding: 16, borderTop: "1px solid #1e1e24", display: "flex", justifyContent: "center" }}>
@@ -1317,7 +1376,30 @@ function VoiceTile({ tile, onClick, big, thumb, volume, onSetVolume }) {
    Barra lateral de servidores
 --------------------------------------------------------- */
 
-function ServerRail({ servers, currentServerId, onHome, onSelect, onCreate, onJoin, homeActive }) {
+function ServerRail({ servers, currentServerId, onHome, onSelect, onCreate, onJoin, homeActive, mobileExpanded }) {
+  if (mobileExpanded) {
+    return (
+      <div style={{ width: "100%", background: "#0e0e12", display: "flex", flexDirection: "column", padding: "10px 12px", overflowY: "auto" }}>
+        <div style={{ fontWeight: 800, fontSize: 18, padding: "10px 8px 16px" }}>Granolas Place</div>
+        <MobileServerRow icon={<BrandMark size={26} />} label="Amigos e mensagens" active={homeActive} onClick={onHome} />
+        <div style={{ height: 1, background: "#1e1e24", margin: "10px 4px" }} />
+        {servers.map((s) => (
+          <MobileServerRow
+            key={s.id}
+            icon={s.icon_url ? <img src={s.icon_url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: 12 }} /> : <span style={{ fontSize: 13, fontWeight: 800 }}>{s.icon}</span>}
+            label={s.name}
+            active={s.id === currentServerId}
+            onClick={() => onSelect(s.id)}
+          />
+        ))}
+        <div style={{ display: "flex", gap: 10, marginTop: 14, padding: "0 4px" }}>
+          <button onClick={onCreate} style={{ ...secondaryBtn, flex: 1, padding: "12px 0" }}>＋ Criar servidor</button>
+          <button onClick={onJoin} style={{ ...secondaryBtn, flex: 1, padding: "12px 0" }}>🔗 Entrar</button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ width: 76, flexShrink: 0, background: "#0e0e12", borderRight: "1px solid #1e1e24", display: "flex", flexDirection: "column", alignItems: "center", padding: "14px 0", gap: 10 }}>
       <RailIcon active={homeActive} onClick={onHome} label="Granolas Place"><BrandMark size={28} /></RailIcon>
@@ -1335,6 +1417,23 @@ function ServerRail({ servers, currentServerId, onHome, onSelect, onCreate, onJo
       </div>
       <button onClick={onCreate} title="Criar servidor" style={railAddBtn}>+</button>
       <button onClick={onJoin} title="Entrar em servidor com ID" style={{ ...railAddBtn, fontSize: 14 }}>🔗</button>
+    </div>
+  );
+}
+
+function MobileServerRow({ icon, label, active, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        display: "flex", alignItems: "center", gap: 12, padding: "12px 10px", borderRadius: 12, cursor: "pointer",
+        background: active ? "var(--accent-soft)" : "transparent", marginBottom: 2,
+      }}
+    >
+      <div style={{ width: 40, height: 40, borderRadius: 12, background: "#1c1c22", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", flexShrink: 0 }}>
+        {icon}
+      </div>
+      <div style={{ fontSize: 15, fontWeight: 600, color: active ? "var(--accent)" : "#F0EEF5" }}>{label}</div>
     </div>
   );
 }
@@ -1376,11 +1475,11 @@ function RailIcon({ active, onClick, children, label }) {
    Sidebar de canais
 --------------------------------------------------------- */
 
-function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel, onCreateCategory, onDeleteCategory, onEditChannel, onDeleteChannel, categories, unreadChannels }) {
+function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, call, onOpenSettings, onCreateChannel, onCreateCategory, onDeleteCategory, onEditChannel, onDeleteChannel, categories, unreadChannels, onBack }) {
   const [creatingType, setCreatingType] = useState(null);
   const [creatingCategory, setCreatingCategory] = useState(false);
   const [editingChannel, setEditingChannel] = useState(null);
-  if (!server) return <div style={{ width: 240, background: "#111114" }} />;
+  if (!server) return <div style={{ width: onBack ? "100%" : 240, background: "#111114" }} />;
 
   const grouped = [...categories].sort((a, b) => a.position - b.position).map((cat) => ({
     category: cat,
@@ -1409,7 +1508,10 @@ function ChannelSidebar({ server, channels, currentChannelId, onSelectChannel, c
   }
 
   return (
-    <div style={{ width: 240, flexShrink: 0, background: "#111114", display: "flex", flexDirection: "column", borderRight: "1px solid #1e1e24" }}>
+    <div style={{ width: onBack ? "100%" : 240, flexShrink: 0, background: "#111114", display: "flex", flexDirection: "column", borderRight: "1px solid #1e1e24" }}>
+      {onBack && (
+        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 14, cursor: "pointer", textAlign: "left", padding: "12px 16px 0" }}>← Servidores</button>
+      )}
       <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid #1e1e24", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontWeight: 700, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{server.name}</div>
@@ -1998,7 +2100,7 @@ function ToolBtn({ active, onClick, children, label, danger }) {
    Chat com Realtime
 --------------------------------------------------------- */
 
-function ChatArea({ channel, profile, onViewProfile }) {
+function ChatArea({ channel, profile, onViewProfile, onBack }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -2117,10 +2219,13 @@ function ChatArea({ channel, profile, onViewProfile }) {
 
   if (channel.type === "voice") {
     return (
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#0a0a0d", color: "#5A5866" }}>
-        <div style={{ fontSize: 40, marginBottom: 10 }}>🔊</div>
-        <div style={{ fontWeight: 700, color: "#F0EEF5", fontSize: 16 }}>{channel.name}</div>
-        <div style={{ fontSize: 13, marginTop: 4 }}>Canal de voz — entre pela barra lateral</div>
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0a0a0d" }}>
+        {onBack && <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 14, cursor: "pointer", textAlign: "left", padding: "14px 16px 0" }}>← Canais</button>}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#5A5866" }}>
+          <div style={{ fontSize: 40, marginBottom: 10 }}>🔊</div>
+          <div style={{ fontWeight: 700, color: "#F0EEF5", fontSize: 16 }}>{channel.name}</div>
+          <div style={{ fontSize: 13, marginTop: 4 }}>Canal de voz — entre pela barra lateral</div>
+        </div>
       </div>
     );
   }
@@ -2128,6 +2233,7 @@ function ChatArea({ channel, profile, onViewProfile }) {
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#0a0a0d", minWidth: 0 }}>
       <div style={{ padding: "14px 20px", borderBottom: "1px solid #1e1e24", fontWeight: 700, fontSize: 14.5, display: "flex", alignItems: "center", gap: 8 }}>
+        {onBack && <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 15, cursor: "pointer", padding: "0 2px 0 0" }}>←</button>}
         <span style={{ opacity: 0.5 }}>#</span> {channel.name}
       </div>
 
@@ -2238,14 +2344,17 @@ function AttachmentView({ attachment }) {
    (Amigos / Adicionar amigo / Pedidos de amizade / servidores)
 --------------------------------------------------------- */
 
-function HomeSidebar({ tab, onSelectTab, pendingCount, dmUnreadCount }) {
+function HomeSidebar({ tab, onSelectTab, pendingCount, dmUnreadCount, onBack }) {
   const navItems = [
     { key: "todos", label: `Amigos${pendingCount ? ` (${pendingCount})` : ""}`, icon: "👥" },
     { key: "mensagens", label: "Mensagens diretas", icon: "💬", badge: dmUnreadCount },
   ];
 
   return (
-    <div style={{ width: 260, flexShrink: 0, background: "#111114", borderRight: "1px solid #1e1e24", display: "flex", flexDirection: "column", padding: "18px 14px" }}>
+    <div style={{ width: onBack ? "100%" : 260, flexShrink: 0, background: "#111114", borderRight: "1px solid #1e1e24", display: "flex", flexDirection: "column", padding: "18px 14px" }}>
+      {onBack && (
+        <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 14, cursor: "pointer", alignSelf: "flex-start", marginBottom: 8, padding: "6px 0" }}>← Servidores</button>
+      )}
       <TiltGlow tilt={4} glow={false} style={{ marginBottom: 18, borderRadius: 12 }}>
         <img src="/logo-full.png" alt="Granolas Place" style={{ width: "100%", maxWidth: 220, objectFit: "contain", display: "block" }} />
       </TiltGlow>
@@ -2292,7 +2401,7 @@ function HomeNavItem({ active, onClick, icon, label, badge }) {
    Amigos — conteúdo principal (varia com a aba escolhida na sidebar)
 --------------------------------------------------------- */
 
-function FriendsMain({ friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage }) {
+function FriendsMain({ friends, pending, onAdd, onRespond, profile, onViewProfile, onMessage, isMobile, onBack }) {
   const [innerTab, setInnerTab] = useState("disponivel");
   const [search, setSearch] = useState("");
   const [showAdd, setShowAdd] = useState(false);
@@ -2308,8 +2417,9 @@ function FriendsMain({ friends, pending, onAdd, onRespond, profile, onViewProfil
   return (
     <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
       <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {onBack && <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 14, cursor: "pointer", textAlign: "left", padding: "14px 24px 0" }}>← Voltar</button>}
         <div style={{ padding: "16px 24px 0", borderBottom: "1px solid #1e1e24", paddingBottom: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap" }}>
             <div style={{ fontWeight: 800, fontSize: 16, display: "flex", alignItems: "center", gap: 6 }}>👥 Amigos</div>
             <div style={{ width: 1, height: 18, background: "#26242c" }} />
             {[["disponivel", "Disponível"], ["todos", "Todos"], ["pendentes", `Pendentes${incoming.length ? ` (${incoming.length})` : ""}`]].map(([k, l]) => (
@@ -2389,7 +2499,7 @@ function FriendsMain({ friends, pending, onAdd, onRespond, profile, onViewProfil
         </div>
       </div>
 
-      <ActiveNowPanel friends={friends} onViewProfile={onViewProfile} />
+      {!isMobile && <ActiveNowPanel friends={friends} onViewProfile={onViewProfile} />}
     </div>
   );
 }
@@ -2988,15 +3098,16 @@ function MenuItem({ children, onClick, danger }) {
    Mensagens diretas
 --------------------------------------------------------- */
 
-function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onViewProfile, unreadDms }) {
+function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onViewProfile, unreadDms, isMobile, onBack }) {
   const friend = friends.find((f) => f.id === dmFriendId);
 
   if (friend) {
-    return <DMChatArea friend={friend} profile={profile} onBack={() => setDmFriendId(null)} onViewProfile={onViewProfile} />;
+    return <DMChatArea friend={friend} profile={profile} onBack={() => setDmFriendId(null)} onViewProfile={onViewProfile} isMobile={isMobile} />;
   }
 
   return (
     <div style={{ flex: 1, background: "#0a0a0d", display: "flex", flexDirection: "column" }}>
+      {onBack && <button onClick={onBack} style={{ background: "transparent", border: "none", color: "#8B8894", fontSize: 14, cursor: "pointer", textAlign: "left", padding: "14px 24px 0" }}>← Voltar</button>}
       <div style={{ padding: "20px 24px", borderBottom: "1px solid #1e1e24", fontWeight: 700, fontSize: 16 }}>Mensagens diretas</div>
       <div style={{ padding: "8px 16px", overflowY: "auto" }}>
         {friends.length === 0 && <div style={{ color: "#5A5866", fontSize: 13, padding: "20px 8px" }}>Adiciona amigos pra poder conversar por aqui.</div>}
@@ -3015,10 +3126,10 @@ function DirectMessagesView({ friends, profile, dmFriendId, setDmFriendId, onVie
   );
 }
 
-function DMChatArea({ friend, profile, onBack, onViewProfile }) {
+function DMChatArea({ friend, profile, onBack, onViewProfile, isMobile }) {
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
-  const [showPanel, setShowPanel] = useState(true);
+  const [showPanel, setShowPanel] = useState(!isMobile);
   const [uploading, setUploading] = useState(false);
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -3134,7 +3245,17 @@ function DMChatArea({ friend, profile, onBack, onViewProfile }) {
       </div>
       </div>
 
-      {showPanel && <DMProfilePanel friend={friend} onViewProfile={onViewProfile} />}
+      {showPanel && (
+        isMobile ? (
+          <div onClick={() => setShowPanel(false)} style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,0.65)", zIndex: 40, display: "flex", justifyContent: "flex-end" }}>
+            <div onClick={(e) => e.stopPropagation()}>
+              <DMProfilePanel friend={friend} onViewProfile={onViewProfile} />
+            </div>
+          </div>
+        ) : (
+          <DMProfilePanel friend={friend} onViewProfile={onViewProfile} />
+        )
+      )}
     </div>
   );
 }
@@ -3214,8 +3335,8 @@ function FriendRow({ f, onViewProfile, onMessage, dim }) {
 
 function ModalShell({ children, onClose }) {
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: "#141418", border: "1px solid #26242c", borderRadius: 16, maxHeight: "88vh", overflowY: "auto", boxShadow: "0 30px 70px -25px rgba(0,0,0,0.7)" }}>
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(5,5,7,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 }}>
+      <div className="granolaModalWrap" onClick={(e) => e.stopPropagation()} style={{ background: "#141418", border: "1px solid #26242c", borderRadius: 16, maxHeight: "88vh", overflowY: "auto", boxShadow: "0 30px 70px -25px rgba(0,0,0,0.7)" }}>
         {children}
       </div>
     </div>
